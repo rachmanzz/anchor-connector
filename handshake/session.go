@@ -138,12 +138,19 @@ func (h *ClientHandshaker) PerformHandshake(conn net.Conn) (SessionState, error)
 		authReq.Credential = ""
 	}
 
+	var authPayload []byte
+	if authReq.Type == wire.AuthTypeStatic {
+		authPayload = wire.EncodeAuthPayload(authReq.Credential)
+	} else {
+		authPayload = wire.EncodeStructuredAuth(authReq)
+	}
+
 	authFrame := wire.Frame{
 		Magic:   wire.Magic,
 		Version: wire.Version,
 		OpCode:  wire.OpAuth,
 		Seq:     1,
-		Payload: wire.EncodeStructuredAuth(authReq),
+		Payload: authPayload,
 	}
 
 	if err := wire.WriteFrame(conn, authFrame); err != nil {
@@ -156,9 +163,26 @@ func (h *ClientHandshaker) PerformHandshake(conn net.Conn) (SessionState, error)
 	}
 	if resp.OpCode == wire.OpResponseError {
 		code, msg, _ := wire.DecodeErrorPayload(resp.Payload)
+		// Fallback for standard token if structured auth was not recognized by backend
+		if code == 400 && authReq.Credential != "" && authReq.Type != wire.AuthTypeStatic {
+			fallbackFrame := wire.Frame{
+				Magic:   wire.Magic,
+				Version: wire.Version,
+				OpCode:  wire.OpAuth,
+				Seq:     1,
+				Payload: wire.EncodeAuthPayload(authReq.Credential),
+			}
+			if fErr := wire.WriteFrame(conn, fallbackFrame); fErr == nil {
+				if fResp, rErr := wire.ReadFrame(conn); rErr == nil && fResp.OpCode != wire.OpResponseError {
+					resp = fResp
+					goto AuthSuccess
+				}
+			}
+		}
 		return state, fmt.Errorf("%w: status %d (%s)", ErrAuthFailed, code, msg)
 	}
 
+AuthSuccess:
 	// If backend issued a new SessionKey (Solusi B or C), persist it locally
 	if issuedKey, keyErr := wire.DecodeAuthResponse(resp.Payload); keyErr == nil && issuedKey != "" {
 		_ = h.SaveSessionKey(issuedKey)
@@ -172,7 +196,7 @@ func (h *ClientHandshaker) PerformHandshake(conn net.Conn) (SessionState, error)
 			Version: wire.Version,
 			OpCode:  wire.OpSelectModel,
 			Seq:     2,
-			Payload: []byte(h.modelName),
+			Payload: wire.EncodeSelectModelPayload(h.modelName),
 		}
 		if err := wire.WriteFrame(conn, selectFrame); err != nil {
 			return state, fmt.Errorf("failed to send OpSelectModel: %w", err)

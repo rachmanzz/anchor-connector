@@ -6,6 +6,7 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"net"
 	"os"
 	"os/signal"
 	"syscall"
@@ -14,6 +15,7 @@ import (
 	"github.com/rachmanzz/anchor-connector/coldstorage"
 	"github.com/rachmanzz/anchor-connector/config"
 	"github.com/rachmanzz/anchor-connector/failover"
+	"github.com/rachmanzz/anchor-connector/handshake"
 	"github.com/rachmanzz/anchor-connector/pool"
 	"github.com/rachmanzz/anchor-connector/proxy"
 	"github.com/rachmanzz/anchor-connector/replication"
@@ -116,6 +118,26 @@ func main() {
 	// 6. Router & Connection Pool
 	r := router.NewRouter(cfg.Routing)
 	p := pool.NewPool(cfg.Pool)
+
+	// Configure outbound backend handshake if configured
+	if cfg.Security.BackendAuth.Token != "" || cfg.Security.BackendAuth.SessionKeyPath != "" {
+		timeout := time.Duration(cfg.Pool.ConnectTimeoutMS) * time.Millisecond
+		if timeout <= 0 {
+			timeout = 2 * time.Second
+		}
+		handshaker := handshake.NewClientHandshaker(
+			cfg.Security.BackendAuth.Token,
+			"",
+			timeout,
+		)
+		if cfg.Security.BackendAuth.SessionKeyPath != "" {
+			handshaker.SetSessionFilePath(cfg.Security.BackendAuth.SessionKeyPath)
+		}
+		p.SetHandshakeFunc(func(c net.Conn, addr string) error {
+			_, hErr := handshaker.PerformHandshake(c)
+			return hErr
+		})
+	}
 
 	// 7. Cold Storage Manager
 	coldMgr, err := coldstorage.NewManager(cfg.ColdStorage)

@@ -102,7 +102,7 @@ func setupMockHandshakeServer(t *testing.T, expectedToken, expectedModel string)
 						}
 
 					case wire.OpSelectModel:
-						modelName := string(frame.Payload)
+						modelName := wire.DecodeSelectModelPayload(frame.Payload)
 						if modelName != expectedModel {
 							resp = wire.Frame{
 								Magic:   wire.Magic,

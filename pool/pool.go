@@ -27,6 +27,10 @@ type BackendConn struct {
 	inUse      bool
 }
 
+// HandshakeFunc executes connection initialization (e.g. auth and model selection)
+// on a newly dialed raw TCP socket before it is marked healthy and added to the pool.
+type HandshakeFunc func(conn net.Conn, addr string) error
+
 // SingleNodePool manages persistent connections to a single backend endpoint (IP:Port).
 type SingleNodePool struct {
 	addr           string
@@ -35,16 +39,18 @@ type SingleNodePool struct {
 	minIdle        int
 	connectTimeout time.Duration
 	idleTimeout    time.Duration
+	handshakeFn    HandshakeFunc
 	mu             sync.Mutex
 	closed         bool
 }
 
 // Pool maintains persistent connection pools to all backend AnchorDB nodes.
 type Pool struct {
-	nodePools map[string]*SingleNodePool
-	cfg       config.PoolConfig
-	mu        sync.RWMutex
-	closed    bool
+	nodePools   map[string]*SingleNodePool
+	cfg         config.PoolConfig
+	handshakeFn HandshakeFunc
+	mu          sync.RWMutex
+	closed      bool
 }
 
 // NewPool creates a global connection pool manager.
@@ -52,6 +58,18 @@ func NewPool(cfg config.PoolConfig) *Pool {
 	return &Pool{
 		nodePools: make(map[string]*SingleNodePool),
 		cfg:       cfg,
+	}
+}
+
+// SetHandshakeFunc registers a callback to authenticate and initialize each newly created socket.
+func (p *Pool) SetHandshakeFunc(fn HandshakeFunc) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.handshakeFn = fn
+	for _, np := range p.nodePools {
+		np.mu.Lock()
+		np.handshakeFn = fn
+		np.mu.Unlock()
 	}
 }
 
@@ -79,6 +97,7 @@ func (p *Pool) Get(addr string) (*BackendConn, error) {
 				minIdle:        p.cfg.MinIdleConnections,
 				connectTimeout: time.Duration(p.cfg.ConnectTimeoutMS) * time.Millisecond,
 				idleTimeout:    time.Duration(p.cfg.IdleTimeoutSeconds) * time.Second,
+				handshakeFn:    p.handshakeFn,
 			}
 			p.nodePools[addr] = np
 		}
@@ -184,6 +203,13 @@ func (np *SingleNodePool) acquire() (*BackendConn, error) {
 		_ = tcpConn.SetNoDelay(true)
 		_ = tcpConn.SetKeepAlive(true)
 		_ = tcpConn.SetKeepAlivePeriod(15 * time.Second)
+	}
+
+	if np.handshakeFn != nil {
+		if err := np.handshakeFn(rawConn, np.addr); err != nil {
+			_ = rawConn.Close()
+			return nil, fmt.Errorf("pool: backend handshake failed for %s: %w", np.addr, err)
+		}
 	}
 
 	bConn := &BackendConn{

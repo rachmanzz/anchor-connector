@@ -1,6 +1,7 @@
 package pool
 
 import (
+	"errors"
 	"net"
 	"testing"
 	"time"
@@ -114,5 +115,51 @@ func TestPoolUnreachableNode(t *testing.T) {
 	_, err := p.Get("127.0.0.1:54321")
 	if err == nil {
 		t.Fatal("expected error connecting to non-existent node, got nil")
+	}
+}
+
+func TestPoolHandshake(t *testing.T) {
+	serverAddr, cleanup := startMockWireServer(t)
+	defer cleanup()
+
+	p := NewPool(config.PoolConfig{
+		MinIdleConnections: 1,
+		MaxConnections:     5,
+		ConnectTimeoutMS:   1000,
+		IdleTimeoutSeconds: 60,
+	})
+	defer p.Close()
+
+	handshakeExecuted := false
+	p.SetHandshakeFunc(func(conn net.Conn, addr string) error {
+		handshakeExecuted = true
+		// Verify ping over socket during handshake
+		ping := wire.Frame{
+			Magic:   wire.Magic,
+			Version: wire.Version,
+			OpCode:  wire.OpPing,
+			Seq:     1,
+		}
+		if err := wire.WriteFrame(conn, ping); err != nil {
+			return err
+		}
+		pong, err := wire.ReadFrame(conn)
+		if err != nil {
+			return err
+		}
+		if pong.OpCode != wire.OpPong {
+			return errors.New("handshake failed: not pong")
+		}
+		return nil
+	})
+
+	conn, err := p.Get(serverAddr)
+	if err != nil {
+		t.Fatalf("p.Get failed: %v", err)
+	}
+	p.Put(conn)
+
+	if !handshakeExecuted {
+		t.Fatal("expected handshake to be executed on new connection")
 	}
 }

@@ -43,12 +43,19 @@ type AuthConfig struct {
 	StaticToken string `yaml:"static_token"`
 }
 
+// BackendAuthConfig defines authentication rules when connector dials backend AnchorDB nodes.
+type BackendAuthConfig struct {
+	Token          string `yaml:"token"`            // Bearer token or OTK
+	SessionKeyPath string `yaml:"session_key_path"` // Path to cached session key file
+}
+
 // SecurityConfig bundles TLS, auth, and network firewalling.
 type SecurityConfig struct {
-	TLS        TLSConfig  `yaml:"tls"`
-	Auth       AuthConfig `yaml:"auth"`
-	EnforceIP  string     `yaml:"enforce_egress_ip"`
-	AllowedIPs []string   `yaml:"allowed_backend_ips"`
+	TLS         TLSConfig         `yaml:"tls"`
+	Auth        AuthConfig        `yaml:"auth"` // Inbound client auth
+	BackendAuth BackendAuthConfig `yaml:"backend_auth"` // Outbound backend auth
+	EnforceIP   string            `yaml:"enforce_egress_ip"`
+	AllowedIPs  []string          `yaml:"allowed_backend_ips"`
 }
 
 // PoolConfig controls backend connection pooling.
@@ -123,6 +130,10 @@ func DefaultConfig() *Config {
 			Auth: AuthConfig{
 				Mode: "none",
 			},
+			BackendAuth: BackendAuthConfig{
+				Token:          "",
+				SessionKeyPath: "./data/connector_session.key",
+			},
 		},
 		Pool: PoolConfig{
 			MinIdleConnections: 8,
@@ -175,6 +186,15 @@ func LoadConfig(filePath string) (*Config, error) {
 	if val := os.Getenv("CONNECTOR_AUTH_TOKEN"); val != "" {
 		cfg.Security.Auth.StaticToken = val
 		cfg.Security.Auth.Mode = "token"
+	}
+	if val := os.Getenv("ANCHORDB_AUTH_TOKEN"); val != "" {
+		cfg.Security.BackendAuth.Token = val
+	}
+	if val := os.Getenv("CONNECTOR_BACKEND_TOKEN"); val != "" {
+		cfg.Security.BackendAuth.Token = val
+	}
+	if val := os.Getenv("CONNECTOR_SESSION_KEY_PATH"); val != "" {
+		cfg.Security.BackendAuth.SessionKeyPath = val
 	}
 	if val := os.Getenv("CONNECTOR_STORAGE_DIR"); val != "" {
 		cfg.ColdStorage.StorageDir = val

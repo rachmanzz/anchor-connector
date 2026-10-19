@@ -163,13 +163,39 @@ func WriteFrame(w io.Writer, f Frame) error {
 	return nil
 }
 
+// EncodeStringPayload encodes a string with a 2-byte little-endian length prefix.
+func EncodeStringPayload(s string) []byte {
+	b := []byte(s)
+	buf := make([]byte, 2+len(b))
+	binary.LittleEndian.PutUint16(buf[0:2], uint16(len(b)))
+	copy(buf[2:], b)
+	return buf
+}
+
 // EncodeAuthPayload encodes a bearer token for OpAuth.
 func EncodeAuthPayload(token string) []byte {
-	tokenBytes := []byte(token)
-	buf := make([]byte, 2+len(tokenBytes))
-	binary.LittleEndian.PutUint16(buf[0:2], uint16(len(tokenBytes)))
-	copy(buf[2:], tokenBytes)
-	return buf
+	return EncodeStringPayload(token)
+}
+
+// EncodeSelectModelPayload encodes a model name for OpSelectModel.
+func EncodeSelectModelPayload(model string) []byte {
+	return EncodeStringPayload(model)
+}
+
+// DecodeStringPayload decodes a string that may be prefixed with a 2-byte little-endian length.
+func DecodeStringPayload(payload []byte) string {
+	if len(payload) >= 2 {
+		strLen := int(binary.LittleEndian.Uint16(payload[0:2]))
+		if len(payload) >= 2+strLen && strLen > 0 {
+			return string(payload[2 : 2+strLen])
+		}
+	}
+	return string(payload)
+}
+
+// DecodeSelectModelPayload decodes a model name from OpSelectModel payload.
+func DecodeSelectModelPayload(payload []byte) string {
+	return DecodeStringPayload(payload)
 }
 
 // DecodeAuthPayload decodes a token payload for OpAuth, supporting both structured and legacy formats.

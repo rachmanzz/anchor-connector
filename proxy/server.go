@@ -17,6 +17,7 @@ import (
 
 	"github.com/rachmanzz/anchor-connector/config"
 	"github.com/rachmanzz/anchor-connector/failover"
+	"github.com/rachmanzz/anchor-connector/handshake"
 	"github.com/rachmanzz/anchor-connector/pool"
 	"github.com/rachmanzz/anchor-connector/replication"
 	"github.com/rachmanzz/anchor-connector/router"
@@ -52,6 +53,25 @@ func NewServer(
 	ipFilter *security.IPFilter,
 	tlsCfg *tls.Config,
 ) *Server {
+	if p != nil && (cfg.Security.BackendAuth.Token != "" || cfg.Security.BackendAuth.SessionKeyPath != "") {
+		timeout := time.Duration(cfg.Pool.ConnectTimeoutMS) * time.Millisecond
+		if timeout <= 0 {
+			timeout = 2 * time.Second
+		}
+		hs := handshake.NewClientHandshaker(
+			cfg.Security.BackendAuth.Token,
+			"",
+			timeout,
+		)
+		if cfg.Security.BackendAuth.SessionKeyPath != "" {
+			hs.SetSessionFilePath(cfg.Security.BackendAuth.SessionKeyPath)
+		}
+		p.SetHandshakeFunc(func(conn net.Conn, addr string) error {
+			_, err := hs.PerformHandshake(conn)
+			return err
+		})
+	}
+
 	return &Server{
 		cfg:       cfg,
 		router:    r,
