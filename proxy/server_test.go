@@ -6,6 +6,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"strings"
 	"testing"
 	"time"
 
@@ -342,6 +343,64 @@ func TestProxy_EndToEnd(t *testing.T) {
 		}
 		if res["status"] != "success" || res["model"] != "users" {
 			t.Fatalf("unexpected http response payload: %+v", res)
+		}
+	})
+
+	// 7. HTTP Cluster Topology
+	t.Run("HTTP Cluster Topology Endpoint", func(t *testing.T) {
+		resp, err := http.Get("http://" + httpAddr + "/api/v1/cluster/topology")
+		if err != nil {
+			t.Fatalf("GET /api/v1/cluster/topology failed: %v", err)
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("expected status 200, got %d", resp.StatusCode)
+		}
+		var res map[string]interface{}
+		if err := json.NewDecoder(resp.Body).Decode(&res); err != nil {
+			t.Fatalf("unmarshal topology failed: %v", err)
+		}
+		if res["status"] != "ok" {
+			t.Fatalf("expected status ok, got %v", res["status"])
+		}
+	})
+
+	// 8. HTTP Storage Overview
+	t.Run("HTTP Storage Overview Endpoint", func(t *testing.T) {
+		resp, err := http.Get("http://" + httpAddr + "/api/v1/storage/overview")
+		if err != nil {
+			t.Fatalf("GET /api/v1/storage/overview failed: %v", err)
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("expected status 200, got %d", resp.StatusCode)
+		}
+		var res map[string]interface{}
+		if err := json.NewDecoder(resp.Body).Decode(&res); err != nil {
+			t.Fatalf("unmarshal storage failed: %v", err)
+		}
+		if res["status"] != "ok" {
+			t.Fatalf("expected status ok, got %v", res["status"])
+		}
+	})
+
+	// 9. Prometheus Metrics Exporter
+	t.Run("Prometheus Metrics Endpoint", func(t *testing.T) {
+		resp, err := http.Get("http://" + httpAddr + "/metrics")
+		if err != nil {
+			t.Fatalf("GET /metrics failed: %v", err)
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("expected status 200, got %d", resp.StatusCode)
+		}
+		body, err := io.ReadAll(resp.Body)
+		if err != nil {
+			t.Fatalf("read metrics body failed: %v", err)
+		}
+		metricsText := string(body)
+		if !strings.Contains(metricsText, "anchor_connector_active_connections") {
+			t.Fatalf("metrics missing anchor_connector_active_connections: %s", metricsText)
 		}
 	})
 }

@@ -113,6 +113,10 @@ func (s *Server) Start() error {
 	mux.HandleFunc("/health", s.handleHTTPHealth)
 	mux.HandleFunc("/api/v1/health", s.handleHTTPHealth)
 	mux.HandleFunc("/api/v1/models/", s.handleHTTPModelQuery)
+	mux.HandleFunc("/api/v1/cluster/topology", s.handleHTTPClusterTopology)
+	mux.HandleFunc("/api/v1/replication/lag", s.handleHTTPReplicationLag)
+	mux.HandleFunc("/api/v1/storage/overview", s.handleHTTPStorageOverview)
+	mux.HandleFunc("/metrics", s.handlePrometheusMetrics)
 
 	s.httpServer = &http.Server{
 		Addr:         s.cfg.Gateway.ListenHTTPAddr,
@@ -402,6 +406,131 @@ func (s *Server) handleHTTPModelQuery(w http.ResponseWriter, r *http.Request) {
 		"model":   modelName,
 		"payload": string(resp.Payload),
 	})
+}
+
+// HTTP Cluster Topology handler: exposes models, primary/replica nodes, circuit breaker, and epoch.
+func (s *Server) handleHTTPClusterTopology(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	var modelList []map[string]interface{}
+
+	for _, m := range s.cfg.Routing.Models {
+		status := "UP"
+		cbState := "CLOSED"
+		epoch := uint64(0)
+
+		if s.failoverCoord != nil {
+			cb := s.failoverCoord.Prober().GetCircuitBreaker(m.Primary)
+			if cb != nil {
+				cbState = cb.State().String()
+				if cb.State() == failover.StateOpen {
+					status = "DOWN"
+				}
+			}
+			epoch = s.failoverCoord.EpochManager().CurrentEpoch(m.Name)
+		}
+
+		modelList = append(modelList, map[string]interface{}{
+			"name":            m.Name,
+			"cluster_id":      m.ClusterID,
+			"primary":         m.Primary,
+			"replicas":        m.Replicas,
+			"primary_status":  status,
+			"circuit_breaker": cbState,
+			"epoch":           epoch,
+		})
+	}
+
+	w.WriteHeader(http.StatusOK)
+	_ = json.NewEncoder(w).Encode(map[string]interface{}{
+		"status": "ok",
+		"models": modelList,
+	})
+}
+
+// HTTP Replication Lag handler: exposes real-time replica lag metrics and unsynced nodes.
+func (s *Server) handleHTTPReplicationLag(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	if s.replicationCoord == nil {
+		w.WriteHeader(http.StatusOK)
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+			"status":  "disabled",
+			"message": "replication coordinator not configured",
+		})
+		return
+	}
+
+	lt := s.replicationCoord.LagTracker()
+	primaryLSN := lt.PrimaryCommitLSN()
+	matrix := lt.GetLagMatrix()
+	unsynced := lt.GetUnsyncedReplicas(primaryLSN)
+
+	w.WriteHeader(http.StatusOK)
+	_ = json.NewEncoder(w).Encode(map[string]interface{}{
+		"status":             "ok",
+		"primary_commit_lsn": primaryLSN,
+		"replicas":           matrix,
+		"unsynced_nodes":     unsynced,
+	})
+}
+
+// HTTP Storage Overview handler: exposes in-memory Hot Buffer and disk Cold Storage statistics.
+func (s *Server) handleHTTPStorageOverview(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	var hotTier map[string]interface{}
+	if s.replicationCoord != nil {
+		oldest, latest, count := s.replicationCoord.RingBuffer().Bounds()
+		hotTier = map[string]interface{}{
+			"count":      count,
+			"oldest_lsn": oldest,
+			"latest_lsn": latest,
+		}
+	} else {
+		hotTier = map[string]interface{}{"status": "disabled"}
+	}
+
+	coldTier := map[string]interface{}{
+		"enabled":                s.cfg.ColdStorage.Enabled,
+		"storage_dir":            s.cfg.ColdStorage.StorageDir,
+		"max_file_size_mb":       s.cfg.ColdStorage.MaxFileSizeMB,
+		"sync_strategy":          s.cfg.ColdStorage.SyncStrategy,
+		"fsync_interval_seconds": s.cfg.ColdStorage.FsyncIntervalSeconds,
+	}
+
+	w.WriteHeader(http.StatusOK)
+	_ = json.NewEncoder(w).Encode(map[string]interface{}{
+		"status":    "ok",
+		"hot_tier":  hotTier,
+		"cold_tier": coldTier,
+	})
+}
+
+// Prometheus Metrics handler: exports standard Prometheus metrics for cluster observability.
+func (s *Server) handlePrometheusMetrics(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
+	w.WriteHeader(http.StatusOK)
+
+	fmt.Fprintf(w, "# HELP anchor_connector_active_connections Current active TCP client connections\n")
+	fmt.Fprintf(w, "# TYPE anchor_connector_active_connections gauge\n")
+	fmt.Fprintf(w, "anchor_connector_active_connections %d\n", s.activeConns.Load())
+
+	if s.replicationCoord != nil {
+		oldest, latest, count := s.replicationCoord.RingBuffer().Bounds()
+		fmt.Fprintf(w, "# HELP anchor_connector_ring_buffer_entries Number of mutations in RAM hot buffer\n")
+		fmt.Fprintf(w, "# TYPE anchor_connector_ring_buffer_entries gauge\n")
+		fmt.Fprintf(w, "anchor_connector_ring_buffer_entries %d\n", count)
+
+		fmt.Fprintf(w, "# HELP anchor_connector_primary_commit_lsn Highest committed LSN on primary\n")
+		fmt.Fprintf(w, "# TYPE anchor_connector_primary_commit_lsn counter\n")
+		fmt.Fprintf(w, "anchor_connector_primary_commit_lsn %d\n", s.replicationCoord.LagTracker().PrimaryCommitLSN())
+
+		fmt.Fprintf(w, "anchor_connector_hot_storage_oldest_lsn %d\n", oldest)
+		fmt.Fprintf(w, "anchor_connector_hot_storage_latest_lsn %d\n", latest)
+
+		for id, state := range s.replicationCoord.LagTracker().GetLagMatrix() {
+			fmt.Fprintf(w, "anchor_connector_replica_lag_lsn{replica=\"%s\"} %d\n", id, state.LagLSN)
+			fmt.Fprintf(w, "anchor_connector_replica_lag_milliseconds{replica=\"%s\"} %d\n", id, state.LagMilliseconds)
+		}
+	}
 }
 
 // Shutdown initiates graceful termination of both TCP and HTTP services.

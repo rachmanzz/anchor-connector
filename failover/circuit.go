@@ -14,6 +14,11 @@ const (
 	StateOpen     State = "OPEN"      // Tripped: node isolated, fast-fail
 )
 
+// String returns the string representation of State.
+func (s State) String() string {
+	return string(s)
+}
+
 // CircuitBreaker guards a backend node against cascading overload and detects failures.
 type CircuitBreaker struct {
 	nodeAddr               string
