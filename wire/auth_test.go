@@ -151,4 +151,3 @@ func TestStagedReauth_EncodeDecode(t *testing.T) {
 		t.Errorf("expected error on truncated staged reauth response")
 	}
 }
-

@@ -279,4 +279,3 @@ func TestLiveAnchorDB_AutoHealing_RestartSurvival(t *testing.T) {
 	}
 	t.Logf("Pool transparent auto-healing verified successfully!")
 }
-

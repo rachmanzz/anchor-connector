@@ -402,6 +402,15 @@ func TestProxy_EndToEnd(t *testing.T) {
 		if !strings.Contains(metricsText, "anchor_connector_active_connections") {
 			t.Fatalf("metrics missing anchor_connector_active_connections: %s", metricsText)
 		}
+		if !strings.Contains(metricsText, "anchor_connector_requests_total") {
+			t.Fatalf("metrics missing anchor_connector_requests_total: %s", metricsText)
+		}
+		if !strings.Contains(metricsText, "anchor_connector_request_duration_seconds") {
+			t.Fatalf("metrics missing anchor_connector_request_duration_seconds: %s", metricsText)
+		}
+		if !strings.Contains(metricsText, "anchor_connector_pool_connections") {
+			t.Fatalf("metrics missing anchor_connector_pool_connections: %s", metricsText)
+		}
 	})
 }
 

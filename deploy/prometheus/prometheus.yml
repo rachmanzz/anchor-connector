@@ -1,0 +1,12 @@
+global:
+  scrape_interval: 5s
+  evaluation_interval: 5s
+
+scrape_configs:
+  - job_name: "anchor-connector"
+    metrics_path: "/metrics"
+    static_configs:
+      - targets: ["anchor-connector:7447"]
+        labels:
+          cluster: "anchor-production"
+          service: "gateway"

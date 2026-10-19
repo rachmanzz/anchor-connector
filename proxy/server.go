@@ -1,7 +1,6 @@
 package proxy
 
 import (
-	"bytes"
 	"context"
 	"crypto/tls"
 	"encoding/json"
@@ -19,6 +18,7 @@ import (
 	"github.com/rachmanzz/anchor-connector/config"
 	"github.com/rachmanzz/anchor-connector/failover"
 	"github.com/rachmanzz/anchor-connector/handshake"
+	"github.com/rachmanzz/anchor-connector/metrics"
 	"github.com/rachmanzz/anchor-connector/pool"
 	"github.com/rachmanzz/anchor-connector/replication"
 	"github.com/rachmanzz/anchor-connector/router"
@@ -204,6 +204,7 @@ func (s *Server) acceptWireConnections() {
 		s.connsMu.Unlock()
 
 		s.activeConns.Add(1)
+		metrics.ActiveConnections.WithLabelValues("wire").Inc()
 		s.wg.Add(1)
 		go s.handleClient(conn)
 	}
@@ -222,6 +223,7 @@ func (s *Server) handleClient(clientConn net.Conn) {
 		delete(s.clientConns, clientConn)
 		s.connsMu.Unlock()
 		s.activeConns.Add(-1)
+		metrics.ActiveConnections.WithLabelValues("wire").Dec()
 		s.wg.Done()
 	}()
 
@@ -249,6 +251,13 @@ func (s *Server) handleClient(clientConn net.Conn) {
 			return
 		}
 
+		reqStart := time.Now()
+		recordMetrics := func(status string) {
+			opStr := fmt.Sprintf("0x%02X", frame.OpCode)
+			metrics.RequestsTotal.WithLabelValues(sess.selectedModel, opStr, "wire", status).Inc()
+			metrics.RequestDuration.WithLabelValues(sess.selectedModel, opStr, "wire").Observe(time.Since(reqStart).Seconds())
+		}
+
 		// Handle OpPing directly at gateway
 		if frame.OpCode == wire.OpPing {
 			pong := wire.Frame{
@@ -261,6 +270,7 @@ func (s *Server) handleClient(clientConn net.Conn) {
 			if err := wire.WriteFrame(clientConn, pong); err != nil {
 				return
 			}
+			recordMetrics("ok")
 			continue
 		}
 
@@ -276,6 +286,7 @@ func (s *Server) handleClient(clientConn net.Conn) {
 					Payload: wire.EncodeErrorPayload(401, "unauthorized: invalid auth token"),
 				}
 				_ = wire.WriteFrame(clientConn, errResp)
+				recordMetrics("unauthorized")
 				return
 			}
 
@@ -289,6 +300,7 @@ func (s *Server) handleClient(clientConn net.Conn) {
 			if err := wire.WriteFrame(clientConn, okResp); err != nil {
 				return
 			}
+			recordMetrics("ok")
 			continue
 		}
 
@@ -302,6 +314,7 @@ func (s *Server) handleClient(clientConn net.Conn) {
 				Payload: wire.EncodeErrorPayload(401, "authentication required: send OpAuth first"),
 			}
 			_ = wire.WriteFrame(clientConn, errResp)
+			recordMetrics("unauthorized")
 			return
 		}
 
@@ -320,6 +333,7 @@ func (s *Server) handleClient(clientConn net.Conn) {
 			if err := wire.WriteFrame(clientConn, okResp); err != nil {
 				return
 			}
+			recordMetrics("ok")
 			continue
 		}
 
@@ -333,6 +347,7 @@ func (s *Server) handleClient(clientConn net.Conn) {
 				Payload: wire.EncodeErrorPayload(503, "cluster memory pressure backpressure active"),
 			}
 			_ = wire.WriteFrame(clientConn, errResp)
+			recordMetrics("throttled")
 			continue
 		}
 
@@ -347,6 +362,7 @@ func (s *Server) handleClient(clientConn net.Conn) {
 				Payload: wire.EncodeErrorPayload(503, err.Error()),
 			}
 			_ = wire.WriteFrame(clientConn, errResp)
+			recordMetrics("routing_error")
 			continue
 		}
 
@@ -389,6 +405,7 @@ func (s *Server) handleClient(clientConn net.Conn) {
 				Payload: wire.EncodeErrorPayload(502, err.Error()),
 			}
 			_ = wire.WriteFrame(clientConn, errResp)
+			recordMetrics("backend_error")
 			continue
 		}
 
@@ -402,6 +419,7 @@ func (s *Server) handleClient(clientConn net.Conn) {
 		if err := wire.WriteFrame(clientConn, backendResp); err != nil {
 			return
 		}
+		recordMetrics("ok")
 	}
 }
 
@@ -418,16 +436,27 @@ func (s *Server) handleHTTPHealth(w http.ResponseWriter, r *http.Request) {
 
 // HTTP Model Query handler: transcodes REST to AnchorWire binary frame
 func (s *Server) handleHTTPModelQuery(w http.ResponseWriter, r *http.Request) {
+	start := time.Now()
+	status := "ok"
+	modelName := "unknown"
+
+	defer func() {
+		metrics.RequestsTotal.WithLabelValues(modelName, "0x16", "http", status).Inc()
+		metrics.RequestDuration.WithLabelValues(modelName, "0x16", "http").Observe(time.Since(start).Seconds())
+	}()
+
 	parts := strings.Split(strings.TrimPrefix(r.URL.Path, "/api/v1/models/"), "/")
 	if len(parts) == 0 || parts[0] == "" {
+		status = "error"
 		http.Error(w, `{"error": "model name required in URL path"}`, http.StatusBadRequest)
 		return
 	}
-	modelName := parts[0]
+	modelName = parts[0]
 
 	// Forward simple OpList or OpGet to backend
 	targetNode, _, err := s.router.SelectTarget(modelName, wire.OpList, wire.FlagNone)
 	if err != nil {
+		status = "error"
 		http.Error(w, fmt.Sprintf(`{"error": "%s"}`, err.Error()), http.StatusServiceUnavailable)
 		return
 	}
@@ -441,12 +470,14 @@ func (s *Server) handleHTTPModelQuery(w http.ResponseWriter, r *http.Request) {
 
 	resp, err := s.pool.ExecuteFrame(targetNode, reqFrame, 5*time.Second)
 	if err != nil {
+		status = "error"
 		http.Error(w, fmt.Sprintf(`{"error": "backend execute failed: %s"}`, err.Error()), http.StatusBadGateway)
 		return
 	}
 
 	w.Header().Set("Content-Type", "application/json")
 	if resp.OpCode == wire.OpResponseError {
+		status = "error"
 		code, msg, _ := wire.DecodeErrorPayload(resp.Payload)
 		w.WriteHeader(http.StatusBadRequest)
 		_ = json.NewEncoder(w).Encode(map[string]interface{}{
@@ -565,30 +596,59 @@ func (s *Server) handlePrometheusMetrics(w http.ResponseWriter, r *http.Request)
 	w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
 	w.WriteHeader(http.StatusOK)
 
-	var buf bytes.Buffer
-	fmt.Fprintf(&buf, "# HELP anchor_connector_active_connections Current active TCP client connections\n")
-	fmt.Fprintf(&buf, "# TYPE anchor_connector_active_connections gauge\n")
-	fmt.Fprintf(&buf, "anchor_connector_active_connections %d\n", s.activeConns.Load())
+	// Sample active client connections
+	metrics.ActiveConnections.WithLabelValues("wire").Set(s.activeConns.Load())
 
-	if s.replicationCoord != nil {
-		oldest, latest, count := s.replicationCoord.RingBuffer().Bounds()
-		fmt.Fprintf(&buf, "# HELP anchor_connector_ring_buffer_entries Number of mutations in RAM hot buffer\n")
-		fmt.Fprintf(&buf, "# TYPE anchor_connector_ring_buffer_entries gauge\n")
-		fmt.Fprintf(&buf, "anchor_connector_ring_buffer_entries %d\n", count)
-
-		fmt.Fprintf(&buf, "# HELP anchor_connector_primary_commit_lsn Highest committed LSN on primary\n")
-		fmt.Fprintf(&buf, "# TYPE anchor_connector_primary_commit_lsn counter\n")
-		fmt.Fprintf(&buf, "anchor_connector_primary_commit_lsn %d\n", s.replicationCoord.LagTracker().PrimaryCommitLSN())
-
-		fmt.Fprintf(&buf, "anchor_connector_hot_storage_oldest_lsn %d\n", oldest)
-		fmt.Fprintf(&buf, "anchor_connector_hot_storage_latest_lsn %d\n", latest)
-
-		for id, state := range s.replicationCoord.LagTracker().GetLagMatrix() {
-			fmt.Fprintf(&buf, "anchor_connector_replica_lag_lsn{replica=\"%s\"} %d\n", id, state.LagLSN)
-			fmt.Fprintf(&buf, "anchor_connector_replica_lag_milliseconds{replica=\"%s\"} %d\n", id, state.LagMilliseconds)
+	// Sample connection pool stats
+	if s.pool != nil {
+		for _, ps := range s.pool.Stats() {
+			metrics.PoolConnections.WithLabelValues(ps.BackendAddr, "active").Set(int64(ps.ActiveConns))
+			metrics.PoolConnections.WithLabelValues(ps.BackendAddr, "idle").Set(int64(ps.IdleConns))
+			metrics.PoolConnections.WithLabelValues(ps.BackendAddr, "mux").Set(int64(ps.MuxConns))
+			metrics.PoolInFlightRequests.WithLabelValues(ps.BackendAddr).Set(int64(ps.InFlight))
 		}
 	}
-	_, _ = w.Write(buf.Bytes())
+
+	// Sample circuit breaker states
+	if s.failoverCoord != nil {
+		for _, m := range s.cfg.Routing.Models {
+			nodes := append([]string{m.Primary}, m.Replicas...)
+			for _, node := range nodes {
+				if node == "" {
+					continue
+				}
+				cb := s.failoverCoord.Prober().GetCircuitBreaker(node)
+				if cb != nil {
+					closedVal, openVal, halfOpenVal := int64(0), int64(0), int64(0)
+					switch cb.State() {
+					case failover.StateClosed:
+						closedVal = 1
+					case failover.StateOpen:
+						openVal = 1
+					case failover.StateHalfOpen:
+						halfOpenVal = 1
+					}
+					metrics.CircuitBreakerState.WithLabelValues(node, "CLOSED").Set(closedVal)
+					metrics.CircuitBreakerState.WithLabelValues(node, "OPEN").Set(openVal)
+					metrics.CircuitBreakerState.WithLabelValues(node, "HALF_OPEN").Set(halfOpenVal)
+				}
+			}
+		}
+	}
+
+	// Sample replication coordinator metrics
+	if s.replicationCoord != nil {
+		_, _, count := s.replicationCoord.RingBuffer().Bounds()
+		metrics.RingBufferEntries.WithLabelValues().Set(int64(count))
+		metrics.PrimaryCommitLSN.WithLabelValues().Set(int64(s.replicationCoord.LagTracker().PrimaryCommitLSN()))
+
+		for id, state := range s.replicationCoord.LagTracker().GetLagMatrix() {
+			metrics.ReplicationLagLSN.WithLabelValues(id).Set(int64(state.LagLSN))
+			metrics.ReplicationLagMS.WithLabelValues(id).Set(state.LagMilliseconds)
+		}
+	}
+
+	metrics.DefaultRegistry.WritePrometheus(w)
 }
 
 // Shutdown initiates graceful termination of both TCP and HTTP services.

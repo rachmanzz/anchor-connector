@@ -60,10 +60,12 @@ type SecurityConfig struct {
 
 // PoolConfig controls backend connection pooling.
 type PoolConfig struct {
-	MinIdleConnections int `yaml:"min_idle_connections"`
-	MaxConnections     int `yaml:"max_connections"`
-	ConnectTimeoutMS   int `yaml:"connect_timeout_ms"`
-	IdleTimeoutSeconds int `yaml:"idle_timeout_seconds"`
+	MinIdleConnections       int  `yaml:"min_idle_connections"`
+	MaxConnections           int  `yaml:"max_connections"`
+	ConnectTimeoutMS         int  `yaml:"connect_timeout_ms"`
+	IdleTimeoutSeconds       int  `yaml:"idle_timeout_seconds"`
+	MultiplexingEnabled      bool `yaml:"multiplexing_enabled"`
+	MaxInFlightPerConnection int  `yaml:"max_in_flight_per_connection"`
 }
 
 // ModelConfig maps a single model to its Primary, Replica, and Compute nodes.
@@ -139,10 +141,12 @@ func DefaultConfig() *Config {
 			},
 		},
 		Pool: PoolConfig{
-			MinIdleConnections: 8,
-			MaxConnections:     64,
-			ConnectTimeoutMS:   1000,
-			IdleTimeoutSeconds: 60,
+			MinIdleConnections:       8,
+			MaxConnections:           64,
+			ConnectTimeoutMS:         1000,
+			IdleTimeoutSeconds:       60,
+			MultiplexingEnabled:      true,
+			MaxInFlightPerConnection: 1024,
 		},
 		Routing: RoutingConfig{
 			DefaultCluster:      "default",

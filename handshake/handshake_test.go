@@ -895,5 +895,3 @@ func TestClientHandshaker_AutoHealing_InvalidPreimage_1004(t *testing.T) {
 		t.Fatalf("expected StateReady, got %v", state2)
 	}
 }
-
-
