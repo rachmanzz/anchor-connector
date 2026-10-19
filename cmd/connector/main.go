@@ -22,7 +22,7 @@ const (
 	Version = "v0.1.0"
 	Banner  = `
 ==============================================================
-   ANCHOR CONNECTOR - Enterprise Edge Gateway & Smart Proxy
+   ANCHOR CONNECTOR - TCP Gateway & Cluster Coordinator
 ==============================================================`
 )
 

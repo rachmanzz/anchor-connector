@@ -1,20 +1,22 @@
 # Anchor Connector
 
-High-Performance Intelligent Edge Gateway, Dynamic Connection Pool, Model Sharder, and Native Cold Storage Archive for AnchorDB.
+TCP Gateway, Persistent Connection Pool, Model Partition Router, and Local Binary Cold Storage for AnchorDB.
 
 ---
 
 ## 🚀 Overview
 
-`anchor-connector` serves as the enterprise-grade ingress proxy and edge coordinator for **AnchorDB**. Built on top of the native **AnchorWire binary protocol** (`0xA5`), it sits between client applications and backend AnchorDB storage engines to provide:
+`anchor-connector` is an edge TCP reverse proxy and coordinator for **AnchorDB**. Built on top of the **AnchorWire binary protocol** (`0xA5`), it sits between client applications and backend AnchorDB storage instances to provide:
 
-- **AnchorWire Binary Gateway (Port 7448)**: Zero-overhead, 16-byte fixed-header frame routing with CRC32 integrity verification.
-- **HTTP REST / Transcoding Gateway (Port 7447)**: Translates external HTTP JSON queries into native AnchorWire binary frames for simplified edge consumption.
-- **Domain-Driven Flat Architecture**: Production-grade Go codebase adhering strictly to standard Go idioms without unnecessary indirection.
-- **Security & TLS Flexibility**: Native TLS 1.3, Bring Your Own Certificate (BYOC), and in-memory self-signed generation, alongside token verification (constant-time comparison) and CIDR IP whitelisting.
-- **Model-Aware Sharding**: Directs read/write operations to the authoritative primary or load-balanced read replicas based on model names.
-- **Persistent Connection Pooling**: Health-checked persistent TCP sockets to backend AnchorDB instances with automatic dead-node detection and keep-alives.
-- **Native Cold Storage (`.acold`)**: Self-contained, immutable binary archive format with 32-byte headers and CRC32 checks—zero external cloud or S3 dependencies.
+- **AnchorWire Binary Gateway (Port 7448)**: 16-byte fixed-header frame routing with CRC32-IEEE integrity verification.
+- **HTTP REST / Transcoding Gateway (Port 7447)**: Translates external HTTP JSON queries into native AnchorWire binary frames.
+- **Domain-Driven Flat Layout**: Root packages organized by functional domain without unnecessary indirection.
+- **Security & TLS Flexibility**: TLS 1.3, Bring Your Own Certificate (BYOC), token authentication with constant-time verification, and CIDR IP whitelisting.
+- **Model Partition Routing**: Directs mutating operations to the primary node and distributes read queries across read replicas.
+- **Persistent Connection Pooling**: Persistent TCP sockets to backend AnchorDB instances (port 7448) with health probing and dead-node isolation.
+- **Semi-Sync Quorum & Ring Buffer**: Circular memory buffer for transient replication delta streaming and configurable write quorum.
+- **Automated Failover & Epoch Fencing**: Circuit breaker monitoring, monotonic generation IDs, and HMAC-SHA256 fencing tokens.
+- **Native Cold Storage (`.acold`)**: Local binary archive format with 32-byte headers and CRC32 checks—without external cloud or S3 dependencies.
 
 ---
 
