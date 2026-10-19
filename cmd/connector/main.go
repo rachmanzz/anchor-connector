@@ -276,5 +276,9 @@ func main() {
 		_ = coldMgr.Close()
 	}
 
+	if rbacEnf != nil && rbacEnf.Store() != nil {
+		_ = rbacEnf.Store().Close()
+	}
+
 	log.Println("[anchor-connector] Shutdown completed cleanly. Goodbye.")
 }

@@ -73,9 +73,10 @@ func (u *RBACUserConfig) ResolveToken() string {
 
 // RBACConfig controls role-based access control policies.
 type RBACConfig struct {
-	Enabled bool             `yaml:"enabled"`
-	Roles   []RBACRoleConfig `yaml:"roles"`
-	Users   []RBACUserConfig `yaml:"users"`
+	Enabled   bool             `yaml:"enabled"`
+	StorePath string           `yaml:"store_path"` // Path to local native rbac.acold binary file
+	Roles     []RBACRoleConfig `yaml:"roles"`
+	Users     []RBACUserConfig `yaml:"users"`
 }
 
 // BackendAuthConfig defines authentication rules when connector dials backend AnchorDB nodes.
@@ -241,6 +242,9 @@ func LoadConfig(filePath string) (*Config, error) {
 	}
 	if val := os.Getenv("CONNECTOR_STORAGE_DIR"); val != "" {
 		cfg.ColdStorage.StorageDir = val
+	}
+	if val := os.Getenv("CONNECTOR_RBAC_STORE_PATH"); val != "" {
+		cfg.Security.RBAC.StorePath = val
 	}
 	if val := os.Getenv("PRIMARY_NODE"); val != "" {
 		// Quick single-node setup via environment variable

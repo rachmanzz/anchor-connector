@@ -155,6 +155,12 @@ func (s *Server) Start() error {
 	mux.HandleFunc("/api/v1/admin/nodes/drain", s.handleHTTPAdminDrain)
 	mux.HandleFunc("/api/v1/admin/nodes/uncordon", s.handleHTTPAdminUncordon)
 	mux.HandleFunc("/api/v1/admin/draining", s.handleHTTPAdminDraining)
+	mux.HandleFunc("/api/v1/admin/rbac/roles", s.handleHTTPAdminRBACRoles)
+	mux.HandleFunc("/api/v1/admin/rbac/users", s.handleHTTPAdminRBACUsers)
+	mux.HandleFunc("/api/v1/admin/rbac/assign", s.handleHTTPAdminRBACAssign)
+	mux.HandleFunc("/api/v1/admin/rbac/revoke", s.handleHTTPAdminRBACRevoke)
+	mux.HandleFunc("/api/v1/admin/rbac/tokens", s.handleHTTPAdminRBACTokens)
+	mux.HandleFunc("/api/v1/admin/rbac/compact", s.handleHTTPAdminRBACCompact)
 	mux.HandleFunc("/metrics", s.handlePrometheusMetrics)
 
 	s.httpServer = &http.Server{
@@ -876,6 +882,356 @@ func (s *Server) handleHTTPAdminDraining(w http.ResponseWriter, r *http.Request)
 	_ = json.NewEncoder(w).Encode(map[string]interface{}{
 		"status":         "ok",
 		"draining_nodes": states,
+	})
+}
+
+// authenticateAdmin verifies caller credentials and ensures cluster admin permissions.
+func (s *Server) authenticateAdmin(r *http.Request) error {
+	if s.auth == nil || !s.auth.IsEnabled() {
+		return nil
+	}
+
+	authHdr := r.Header.Get("Authorization")
+	var token string
+	if strings.HasPrefix(strings.ToLower(authHdr), "bearer ") {
+		token = strings.TrimSpace(authHdr[7:])
+	} else {
+		token = r.Header.Get("X-Auth-Token")
+	}
+
+	if token == "" {
+		return security.ErrUnauthorized
+	}
+
+	subject, err := s.auth.AuthenticateTokenWithSubject(token)
+	if err != nil {
+		return security.ErrUnauthorized
+	}
+
+	if s.auth.Enforcer() != nil && s.auth.Enforcer().IsEnabled() {
+		allowed, err := s.auth.Enforcer().Enforce(subject, "*", security.ActionClusterAdmin)
+		if err != nil || !allowed {
+			return security.ErrPermissionDenied
+		}
+	}
+
+	return nil
+}
+
+type rbacAssignRequest struct {
+	Subject string `json:"subject"`
+	Role    string `json:"role"`
+}
+
+type rbacTokenRequest struct {
+	Token   string `json:"token"`
+	Subject string `json:"subject"`
+}
+
+// HTTP Admin RBAC Roles handler: lists, creates, or deletes roles.
+func (s *Server) handleHTTPAdminRBACRoles(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	if err := s.authenticateAdmin(r); err != nil {
+		if errors.Is(err, security.ErrUnauthorized) {
+			w.WriteHeader(http.StatusUnauthorized)
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": "unauthorized"})
+			return
+		}
+		w.WriteHeader(http.StatusForbidden)
+		_ = json.NewEncoder(w).Encode(map[string]string{"error": "forbidden: requires cluster admin"})
+		return
+	}
+
+	if s.auth == nil || s.auth.Enforcer() == nil {
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_ = json.NewEncoder(w).Encode(map[string]string{"error": "rbac enforcer not configured"})
+		return
+	}
+	enf := s.auth.Enforcer()
+
+	switch r.Method {
+	case http.MethodGet:
+		roles := enf.ListRoles()
+		w.WriteHeader(http.StatusOK)
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+			"status": "ok",
+			"roles":  roles,
+		})
+
+	case http.MethodPost:
+		var role security.Role
+		if err := json.NewDecoder(r.Body).Decode(&role); err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": "invalid json: " + err.Error()})
+			return
+		}
+		if err := enf.RegisterRole(role); err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+			"status": "ok",
+			"role":   role.Name,
+		})
+
+	case http.MethodDelete:
+		roleName := r.URL.Query().Get("name")
+		if roleName == "" {
+			w.WriteHeader(http.StatusBadRequest)
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": "query param 'name' is required"})
+			return
+		}
+		if err := enf.DeleteRole(roleName); err != nil {
+			if errors.Is(err, security.ErrRoleNotFound) {
+				w.WriteHeader(http.StatusNotFound)
+				_ = json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+				return
+			}
+			w.WriteHeader(http.StatusBadRequest)
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+			"status":  "ok",
+			"deleted": roleName,
+		})
+
+	default:
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		_ = json.NewEncoder(w).Encode(map[string]string{"error": "method not allowed"})
+	}
+}
+
+// HTTP Admin RBAC Users handler: lists all registered subjects and assigned roles.
+func (s *Server) handleHTTPAdminRBACUsers(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	if err := s.authenticateAdmin(r); err != nil {
+		if errors.Is(err, security.ErrUnauthorized) {
+			w.WriteHeader(http.StatusUnauthorized)
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": "unauthorized"})
+			return
+		}
+		w.WriteHeader(http.StatusForbidden)
+		_ = json.NewEncoder(w).Encode(map[string]string{"error": "forbidden: requires cluster admin"})
+		return
+	}
+
+	if s.auth == nil || s.auth.Enforcer() == nil {
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_ = json.NewEncoder(w).Encode(map[string]string{"error": "rbac enforcer not configured"})
+		return
+	}
+
+	if r.Method != http.MethodGet {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		_ = json.NewEncoder(w).Encode(map[string]string{"error": "method not allowed"})
+		return
+	}
+
+	users := s.auth.Enforcer().ListUsers()
+	w.WriteHeader(http.StatusOK)
+	_ = json.NewEncoder(w).Encode(map[string]interface{}{
+		"status": "ok",
+		"users":  users,
+	})
+}
+
+// HTTP Admin RBAC Assign handler: binds a role to a subject.
+func (s *Server) handleHTTPAdminRBACAssign(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	if err := s.authenticateAdmin(r); err != nil {
+		if errors.Is(err, security.ErrUnauthorized) {
+			w.WriteHeader(http.StatusUnauthorized)
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": "unauthorized"})
+			return
+		}
+		w.WriteHeader(http.StatusForbidden)
+		_ = json.NewEncoder(w).Encode(map[string]string{"error": "forbidden: requires cluster admin"})
+		return
+	}
+
+	if s.auth == nil || s.auth.Enforcer() == nil {
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_ = json.NewEncoder(w).Encode(map[string]string{"error": "rbac enforcer not configured"})
+		return
+	}
+
+	if r.Method != http.MethodPost {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		_ = json.NewEncoder(w).Encode(map[string]string{"error": "method not allowed"})
+		return
+	}
+
+	var req rbacAssignRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		w.WriteHeader(http.StatusBadRequest)
+		_ = json.NewEncoder(w).Encode(map[string]string{"error": "invalid json: " + err.Error()})
+		return
+	}
+
+	if err := s.auth.Enforcer().AssignRole(req.Subject, req.Role); err != nil {
+		w.WriteHeader(http.StatusBadRequest)
+		_ = json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+		return
+	}
+
+	w.WriteHeader(http.StatusOK)
+	_ = json.NewEncoder(w).Encode(map[string]interface{}{
+		"status":        "ok",
+		"subject":       req.Subject,
+		"assigned_role": req.Role,
+	})
+}
+
+// HTTP Admin RBAC Revoke handler: revokes a role from a subject (writes tombstone).
+func (s *Server) handleHTTPAdminRBACRevoke(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	if err := s.authenticateAdmin(r); err != nil {
+		if errors.Is(err, security.ErrUnauthorized) {
+			w.WriteHeader(http.StatusUnauthorized)
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": "unauthorized"})
+			return
+		}
+		w.WriteHeader(http.StatusForbidden)
+		_ = json.NewEncoder(w).Encode(map[string]string{"error": "forbidden: requires cluster admin"})
+		return
+	}
+
+	if s.auth == nil || s.auth.Enforcer() == nil {
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_ = json.NewEncoder(w).Encode(map[string]string{"error": "rbac enforcer not configured"})
+		return
+	}
+
+	if r.Method != http.MethodPost {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		_ = json.NewEncoder(w).Encode(map[string]string{"error": "method not allowed"})
+		return
+	}
+
+	var req rbacAssignRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		w.WriteHeader(http.StatusBadRequest)
+		_ = json.NewEncoder(w).Encode(map[string]string{"error": "invalid json: " + err.Error()})
+		return
+	}
+
+	if err := s.auth.Enforcer().RevokeRole(req.Subject, req.Role); err != nil {
+		w.WriteHeader(http.StatusBadRequest)
+		_ = json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+		return
+	}
+
+	w.WriteHeader(http.StatusOK)
+	_ = json.NewEncoder(w).Encode(map[string]interface{}{
+		"status":       "ok",
+		"subject":      req.Subject,
+		"revoked_role": req.Role,
+	})
+}
+
+// HTTP Admin RBAC Tokens handler: binds or unbinds tokens.
+func (s *Server) handleHTTPAdminRBACTokens(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	if err := s.authenticateAdmin(r); err != nil {
+		if errors.Is(err, security.ErrUnauthorized) {
+			w.WriteHeader(http.StatusUnauthorized)
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": "unauthorized"})
+			return
+		}
+		w.WriteHeader(http.StatusForbidden)
+		_ = json.NewEncoder(w).Encode(map[string]string{"error": "forbidden: requires cluster admin"})
+		return
+	}
+
+	if s.auth == nil || s.auth.Enforcer() == nil {
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_ = json.NewEncoder(w).Encode(map[string]string{"error": "rbac enforcer not configured"})
+		return
+	}
+	enf := s.auth.Enforcer()
+
+	switch r.Method {
+	case http.MethodPost:
+		var req rbacTokenRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": "invalid json: " + err.Error()})
+			return
+		}
+		enf.BindToken(req.Token, req.Subject)
+		w.WriteHeader(http.StatusOK)
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+			"status":  "ok",
+			"subject": req.Subject,
+		})
+
+	case http.MethodDelete:
+		token := r.URL.Query().Get("token")
+		if token == "" {
+			w.WriteHeader(http.StatusBadRequest)
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": "query param 'token' is required"})
+			return
+		}
+		enf.UnbindToken(token)
+		w.WriteHeader(http.StatusOK)
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+			"status":  "ok",
+			"unbound": true,
+		})
+
+	default:
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		_ = json.NewEncoder(w).Encode(map[string]string{"error": "method not allowed"})
+	}
+}
+
+// HTTP Admin RBAC Compact handler: compacts the .acold binary store to prune historical tombstones.
+func (s *Server) handleHTTPAdminRBACCompact(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	if err := s.authenticateAdmin(r); err != nil {
+		if errors.Is(err, security.ErrUnauthorized) {
+			w.WriteHeader(http.StatusUnauthorized)
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": "unauthorized"})
+			return
+		}
+		w.WriteHeader(http.StatusForbidden)
+		_ = json.NewEncoder(w).Encode(map[string]string{"error": "forbidden: requires cluster admin"})
+		return
+	}
+
+	if s.auth == nil || s.auth.Enforcer() == nil {
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_ = json.NewEncoder(w).Encode(map[string]string{"error": "rbac enforcer not configured"})
+		return
+	}
+
+	if r.Method != http.MethodPost {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		_ = json.NewEncoder(w).Encode(map[string]string{"error": "method not allowed"})
+		return
+	}
+
+	st := s.auth.Enforcer().Store()
+	if st == nil {
+		w.WriteHeader(http.StatusBadRequest)
+		_ = json.NewEncoder(w).Encode(map[string]string{"error": "rbac store persistence is not enabled"})
+		return
+	}
+
+	if err := st.Compact(); err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		_ = json.NewEncoder(w).Encode(map[string]string{"error": "compaction failed: " + err.Error()})
+		return
+	}
+
+	w.WriteHeader(http.StatusOK)
+	_ = json.NewEncoder(w).Encode(map[string]interface{}{
+		"status":    "ok",
+		"compacted": true,
 	})
 }
 

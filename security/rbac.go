@@ -58,6 +58,7 @@ type Enforcer struct {
 	tokenUsers map[string]string              // token -> subject
 	cache      map[string]bool                // cacheKey(subject, tenant, action) -> allowed
 	mu         sync.RWMutex
+	store      *RBACStore                     // optional append-only binary store
 }
 
 // NewEnforcer creates an initialized Enforcer.
@@ -69,6 +70,20 @@ func NewEnforcer(enabled bool) *Enforcer {
 		tokenUsers: make(map[string]string),
 		cache:      make(map[string]bool),
 	}
+}
+
+// AttachStore binds an append-only RBACStore to persist future mutations.
+func (e *Enforcer) AttachStore(store *RBACStore) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.store = store
+}
+
+// Store returns the attached RBACStore or nil.
+func (e *Enforcer) Store() *RBACStore {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	return e.store
 }
 
 // IsEnabled reports whether RBAC evaluation is enforced.
@@ -87,7 +102,31 @@ func (e *Enforcer) SetEnabled(enabled bool) {
 }
 
 // RegisterRole registers or updates a role definition, checking for inheritance cycles.
+// If an RBACStore is attached, the mutation is persisted to the append-only binary log.
 func (e *Enforcer) RegisterRole(role Role) error {
+	role.Name = strings.TrimSpace(role.Name)
+	if role.Name == "" {
+		return ErrInvalidRoleName
+	}
+
+	e.mu.RLock()
+	st := e.store
+	e.mu.RUnlock()
+
+	if st != nil {
+		e.mu.RLock()
+		err := e.detectCycle(role.Name, role.Parents)
+		e.mu.RUnlock()
+		if err != nil {
+			return err
+		}
+		return st.RegisterRole(role)
+	}
+
+	return e.registerRoleMemory(role)
+}
+
+func (e *Enforcer) registerRoleMemory(role Role) error {
 	role.Name = strings.TrimSpace(role.Name)
 	if role.Name == "" {
 		return ErrInvalidRoleName
@@ -96,7 +135,6 @@ func (e *Enforcer) RegisterRole(role Role) error {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
-	// Verify no circular inheritance before applying
 	if err := e.detectCycle(role.Name, role.Parents); err != nil {
 		return err
 	}
@@ -107,14 +145,52 @@ func (e *Enforcer) RegisterRole(role Role) error {
 		Permissions: append([]Permission{}, role.Permissions...),
 	}
 	e.roles[role.Name] = rCopy
-
-	// Invalidate evaluation cache
 	e.cache = make(map[string]bool)
 	return nil
 }
 
+// DeleteRole removes a role definition and clears user assignments.
+// If an RBACStore is attached, a Tombstone record is written to the append-only binary log.
+func (e *Enforcer) DeleteRole(roleName string) error {
+	roleName = strings.TrimSpace(roleName)
+	if roleName == "" {
+		return ErrInvalidRoleName
+	}
+
+	e.mu.RLock()
+	if _, exists := e.roles[roleName]; !exists {
+		e.mu.RUnlock()
+		return fmt.Errorf("%w: %s", ErrRoleNotFound, roleName)
+	}
+	st := e.store
+	e.mu.RUnlock()
+
+	if st != nil {
+		return st.DeleteRole(roleName)
+	}
+
+	e.deleteRoleMemory(roleName)
+	return nil
+}
+
+func (e *Enforcer) deleteRoleMemory(roleName string) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	delete(e.roles, roleName)
+
+	for subject, roles := range e.userRoles {
+		delete(roles, roleName)
+		if len(roles) == 0 {
+			delete(e.userRoles, subject)
+		}
+	}
+
+	e.cache = make(map[string]bool)
+}
+
 // detectCycle checks whether adding roleName with parents would cause a cycle.
-// e.mu must be held.
+// e.mu must be held (at least read lock).
 func (e *Enforcer) detectCycle(roleName string, parents []string) error {
 	visited := make(map[string]bool)
 	var dfs func(curr string) bool
@@ -148,6 +224,7 @@ func (e *Enforcer) detectCycle(roleName string, parents []string) error {
 }
 
 // AssignRole assigns a role to a subject (user or client identifier).
+// If an RBACStore is attached, the mutation is persisted to the append-only binary log.
 func (e *Enforcer) AssignRole(subject, roleName string) error {
 	subject = strings.TrimSpace(subject)
 	roleName = strings.TrimSpace(roleName)
@@ -155,6 +232,22 @@ func (e *Enforcer) AssignRole(subject, roleName string) error {
 		return errors.New("rbac: subject and roleName cannot be empty")
 	}
 
+	e.mu.RLock()
+	if _, exists := e.roles[roleName]; !exists {
+		e.mu.RUnlock()
+		return fmt.Errorf("%w: %s", ErrRoleNotFound, roleName)
+	}
+	st := e.store
+	e.mu.RUnlock()
+
+	if st != nil {
+		return st.AssignRole(subject, roleName)
+	}
+
+	return e.assignRoleMemory(subject, roleName)
+}
+
+func (e *Enforcer) assignRoleMemory(subject, roleName string) error {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
@@ -168,17 +261,155 @@ func (e *Enforcer) AssignRole(subject, roleName string) error {
 		e.userRoles[subject] = roles
 	}
 	roles[roleName] = struct{}{}
-
-	// Invalidate cache
 	e.cache = make(map[string]bool)
 	return nil
 }
 
+// RevokeRole revokes a role assignment from a subject.
+// If an RBACStore is attached, a Tombstone record is written to the append-only binary log.
+func (e *Enforcer) RevokeRole(subject, roleName string) error {
+	subject = strings.TrimSpace(subject)
+	roleName = strings.TrimSpace(roleName)
+	if subject == "" || roleName == "" {
+		return errors.New("rbac: subject and roleName cannot be empty")
+	}
+
+	e.mu.RLock()
+	st := e.store
+	e.mu.RUnlock()
+
+	if st != nil {
+		return st.RevokeRole(subject, roleName)
+	}
+
+	e.revokeRoleMemory(subject, roleName)
+	return nil
+}
+
+func (e *Enforcer) revokeRoleMemory(subject, roleName string) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	if roles, exists := e.userRoles[subject]; exists {
+		delete(roles, roleName)
+		if len(roles) == 0 {
+			delete(e.userRoles, subject)
+		}
+	}
+	e.cache = make(map[string]bool)
+}
+
 // BindToken registers a bearer token to an existing subject.
+// If an RBACStore is attached, the mutation is persisted to the append-only binary log.
 func (e *Enforcer) BindToken(token, subject string) {
+	token = strings.TrimSpace(token)
+	subject = strings.TrimSpace(subject)
+	if token == "" || subject == "" {
+		return
+	}
+
+	e.mu.RLock()
+	st := e.store
+	e.mu.RUnlock()
+
+	if st != nil {
+		_ = st.BindToken(token, subject)
+		return
+	}
+
+	e.bindTokenMemory(token, subject)
+}
+
+func (e *Enforcer) bindTokenMemory(token, subject string) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	e.tokenUsers[token] = subject
+}
+
+// UnbindToken revokes a bearer token from authentication.
+// If an RBACStore is attached, a Tombstone record is written to the append-only binary log.
+func (e *Enforcer) UnbindToken(token string) {
+	token = strings.TrimSpace(token)
+	if token == "" {
+		return
+	}
+
+	e.mu.RLock()
+	st := e.store
+	e.mu.RUnlock()
+
+	if st != nil {
+		_ = st.UnbindToken(token)
+		return
+	}
+
+	e.unbindTokenMemory(token)
+}
+
+func (e *Enforcer) unbindTokenMemory(token string) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	delete(e.tokenUsers, token)
+}
+
+// ListRoles returns a list of copies of all registered roles.
+func (e *Enforcer) ListRoles() []Role {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+
+	roles := make([]Role, 0, len(e.roles))
+	for _, r := range e.roles {
+		roles = append(roles, Role{
+			Name:        r.Name,
+			Parents:     append([]string{}, r.Parents...),
+			Permissions: append([]Permission{}, r.Permissions...),
+		})
+	}
+	return roles
+}
+
+// GetRole returns a copy of the specified role or ErrRoleNotFound.
+func (e *Enforcer) GetRole(roleName string) (Role, error) {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+
+	r, exists := e.roles[roleName]
+	if !exists {
+		return Role{}, fmt.Errorf("%w: %s", ErrRoleNotFound, roleName)
+	}
+	return Role{
+		Name:        r.Name,
+		Parents:     append([]string{}, r.Parents...),
+		Permissions: append([]Permission{}, r.Permissions...),
+	}, nil
+}
+
+// ListUsers returns a copy of all subjects and their assigned role names.
+func (e *Enforcer) ListUsers() map[string][]string {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+
+	result := make(map[string][]string, len(e.userRoles))
+	for subject, roleSet := range e.userRoles {
+		roles := make([]string, 0, len(roleSet))
+		for r := range roleSet {
+			roles = append(roles, r)
+		}
+		result[subject] = roles
+	}
+	return result
+}
+
+// ListTokens returns a copy of all token to subject mappings.
+func (e *Enforcer) ListTokens() map[string]string {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+
+	result := make(map[string]string, len(e.tokenUsers))
+	for t, s := range e.tokenUsers {
+		result[t] = s
+	}
+	return result
 }
 
 // AuthenticateToken verifies the token against registered subjects using constant-time comparison.
@@ -293,6 +524,7 @@ func OpCodeToAction(op byte) string {
 }
 
 // BuildEnforcer constructs and configures an Enforcer from application configuration.
+// If cfg.StorePath is specified, an append-only .acold binary store is initialized and replayed.
 func BuildEnforcer(cfg config.RBACConfig, defaultAdminToken string) (*Enforcer, error) {
 	if !cfg.Enabled {
 		return NewEnforcer(false), nil
@@ -300,8 +532,8 @@ func BuildEnforcer(cfg config.RBACConfig, defaultAdminToken string) (*Enforcer, 
 
 	enf := NewEnforcer(true)
 
-	// Ensure default superadmin role exists
-	_ = enf.RegisterRole(Role{
+	// Ensure default superadmin role exists in memory
+	_ = enf.registerRoleMemory(Role{
 		Name: "admin",
 		Permissions: []Permission{
 			{Resource: ResourceAll, Action: ActionAll},
@@ -309,8 +541,17 @@ func BuildEnforcer(cfg config.RBACConfig, defaultAdminToken string) (*Enforcer, 
 	})
 
 	if defaultAdminToken != "" {
-		_ = enf.AssignRole("admin", "admin")
-		enf.BindToken(defaultAdminToken, "admin")
+		_ = enf.assignRoleMemory("admin", "admin")
+		enf.bindTokenMemory(defaultAdminToken, "admin")
+	}
+
+	var store *RBACStore
+	if cfg.StorePath != "" {
+		var err error
+		store, err = OpenRBACStore(cfg.StorePath, enf)
+		if err != nil {
+			return nil, fmt.Errorf("failed to initialize rbac store: %w", err)
+		}
 	}
 
 	for _, rCfg := range cfg.Roles {
@@ -322,11 +563,14 @@ func BuildEnforcer(cfg config.RBACConfig, defaultAdminToken string) (*Enforcer, 
 				}
 			}
 		}
-		if err := enf.RegisterRole(Role{
+		if err := enf.registerRoleMemory(Role{
 			Name:        rCfg.Name,
 			Parents:     rCfg.Parents,
 			Permissions: perms,
 		}); err != nil {
+			if store != nil {
+				_ = store.Close()
+			}
 			return nil, err
 		}
 	}
@@ -334,13 +578,26 @@ func BuildEnforcer(cfg config.RBACConfig, defaultAdminToken string) (*Enforcer, 
 	for _, uCfg := range cfg.Users {
 		token := uCfg.ResolveToken()
 		if token != "" {
-			enf.BindToken(token, uCfg.Subject)
+			enf.bindTokenMemory(token, uCfg.Subject)
 		}
 		for _, roleName := range uCfg.Roles {
-			if err := enf.AssignRole(uCfg.Subject, roleName); err != nil {
+			if err := enf.assignRoleMemory(uCfg.Subject, roleName); err != nil {
+				if store != nil {
+					_ = store.Close()
+				}
 				return nil, err
 			}
 		}
+	}
+
+	if store != nil {
+		if store.LSN() == 0 {
+			if err := store.FlushSnapshot(); err != nil {
+				_ = store.Close()
+				return nil, fmt.Errorf("failed to flush initial rbac state: %w", err)
+			}
+		}
+		enf.AttachStore(store)
 	}
 
 	return enf, nil

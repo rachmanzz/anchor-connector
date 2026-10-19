@@ -6,6 +6,8 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -957,3 +959,157 @@ func TestProxy_RBAC_Enforcement(t *testing.T) {
 	}
 	httpResp.Body.Close()
 }
+
+func TestProxy_AdminRBAC_CRUD(t *testing.T) {
+	tmpDir, err := os.MkdirTemp("", "proxy-rbac-*")
+	if err != nil {
+		t.Fatalf("failed to create temp dir: %v", err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	rbacStorePath := filepath.Join(tmpDir, "rbac.acold")
+
+	cfg := &config.Config{
+		Gateway: config.GatewayConfig{
+			ListenWireAddr: "127.0.0.1:0",
+			ListenHTTPAddr: "127.0.0.1:0",
+			ReadTimeoutMS:  1000,
+			WriteTimeoutMS: 1000,
+		},
+		Security: config.SecurityConfig{
+			Auth: config.AuthConfig{
+				Mode:        "token",
+				StaticToken: "super-admin-token",
+			},
+			RBAC: config.RBACConfig{
+				Enabled:   true,
+				StorePath: rbacStorePath,
+			},
+		},
+		Routing: config.RoutingConfig{
+			DefaultCluster: "default",
+			Models: []config.ModelConfig{
+				{
+					Name:      "default",
+					ClusterID: "default",
+					Primary:   "127.0.0.1:9999",
+				},
+			},
+		},
+	}
+
+	r := router.NewRouter(cfg.Routing)
+	p := pool.NewPool(cfg.Pool)
+	defer p.Close()
+
+	auth := security.NewAuthenticator(cfg.Security.Auth.Mode, cfg.Security.Auth.StaticToken)
+	rbacEnf, err := security.BuildEnforcer(cfg.Security.RBAC, cfg.Security.Auth.StaticToken)
+	if err != nil {
+		t.Fatalf("BuildEnforcer failed: %v", err)
+	}
+	auth.SetEnforcer(rbacEnf)
+
+	srv := NewServer(cfg, r, p, auth, nil, nil)
+	if err := srv.Start(); err != nil {
+		t.Fatalf("Server Start failed: %v", err)
+	}
+	defer func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		_ = srv.Shutdown(ctx)
+	}()
+
+	client := &http.Client{Timeout: 3 * time.Second}
+	baseURL := "http://" + srv.HTTPAddr()
+	adminAuth := "Bearer super-admin-token"
+
+	// 1. List existing roles (should contain default "admin")
+	req, _ := http.NewRequest(http.MethodGet, baseURL+"/api/v1/admin/rbac/roles", nil)
+	req.Header.Set("Authorization", adminAuth)
+	resp, err := client.Do(req)
+	if err != nil || resp.StatusCode != http.StatusOK {
+		t.Fatalf("GET roles failed: %v, status: %d", err, resp.StatusCode)
+	}
+	var listResp map[string]interface{}
+	_ = json.NewDecoder(resp.Body).Decode(&listResp)
+	resp.Body.Close()
+
+	// 2. Create role "metrics_viewer" via POST
+	newRoleJSON := `{
+		"name": "metrics_viewer",
+		"permissions": [
+			{"resource": "metrics", "action": "read"}
+		]
+	}`
+	req, _ = http.NewRequest(http.MethodPost, baseURL+"/api/v1/admin/rbac/roles", strings.NewReader(newRoleJSON))
+	req.Header.Set("Authorization", adminAuth)
+	req.Header.Set("Content-Type", "application/json")
+	resp, err = client.Do(req)
+	if err != nil || resp.StatusCode != http.StatusOK {
+		t.Fatalf("POST role failed: %v, status: %d", err, resp.StatusCode)
+	}
+	resp.Body.Close()
+
+	// 3. Bind token to subject "prom_agent"
+	bindJSON := `{"token": "token-prom-secret", "subject": "prom_agent"}`
+	req, _ = http.NewRequest(http.MethodPost, baseURL+"/api/v1/admin/rbac/tokens", strings.NewReader(bindJSON))
+	req.Header.Set("Authorization", adminAuth)
+	req.Header.Set("Content-Type", "application/json")
+	resp, err = client.Do(req)
+	if err != nil || resp.StatusCode != http.StatusOK {
+		t.Fatalf("POST token failed: %v, status: %d", err, resp.StatusCode)
+	}
+	resp.Body.Close()
+
+	// 4. Assign role to subject
+	assignJSON := `{"subject": "prom_agent", "role": "metrics_viewer"}`
+	req, _ = http.NewRequest(http.MethodPost, baseURL+"/api/v1/admin/rbac/assign", strings.NewReader(assignJSON))
+	req.Header.Set("Authorization", adminAuth)
+	req.Header.Set("Content-Type", "application/json")
+	resp, err = client.Do(req)
+	if err != nil || resp.StatusCode != http.StatusOK {
+		t.Fatalf("POST assign failed: %v, status: %d", err, resp.StatusCode)
+	}
+	resp.Body.Close()
+
+	// 5. Verify prom_agent can access metrics resource via RBAC Enforcer
+	enf := srv.auth.Enforcer()
+	allowed, err := enf.Enforce("prom_agent", "metrics", "read")
+	if err != nil || !allowed {
+		t.Fatalf("expected prom_agent to have metrics read permission, got allowed=%v err=%v", allowed, err)
+	}
+
+	// 6. Delete role "metrics_viewer" via DELETE (appends Tombstone to rbac.acold)
+	req, _ = http.NewRequest(http.MethodDelete, baseURL+"/api/v1/admin/rbac/roles?name=metrics_viewer", nil)
+	req.Header.Set("Authorization", adminAuth)
+	resp, err = client.Do(req)
+	if err != nil || resp.StatusCode != http.StatusOK {
+		t.Fatalf("DELETE role failed: %v, status: %d", err, resp.StatusCode)
+	}
+	resp.Body.Close()
+
+	// Verify prom_agent no longer has permission
+	allowed, err = enf.Enforce("prom_agent", "metrics", "read")
+	if err != nil || allowed {
+		t.Fatalf("expected prom_agent permission to be denied after tombstone role deletion, got %v", allowed)
+	}
+
+	// 7. Compact store via POST
+	req, _ = http.NewRequest(http.MethodPost, baseURL+"/api/v1/admin/rbac/compact", nil)
+	req.Header.Set("Authorization", adminAuth)
+	resp, err = client.Do(req)
+	if err != nil || resp.StatusCode != http.StatusOK {
+		t.Fatalf("POST compact failed: %v, status: %d", err, resp.StatusCode)
+	}
+	resp.Body.Close()
+
+	// 8. Verify unauthorized caller is rejected
+	req, _ = http.NewRequest(http.MethodGet, baseURL+"/api/v1/admin/rbac/roles", nil)
+	req.Header.Set("Authorization", "Bearer invalid-token")
+	resp, err = client.Do(req)
+	if err != nil || resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("expected 401 Unauthorized for invalid admin token, got %d", resp.StatusCode)
+	}
+	resp.Body.Close()
+}
+

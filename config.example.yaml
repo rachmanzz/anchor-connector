@@ -19,6 +19,7 @@ security:
     static_token: "" # or "env:CONNECTOR_AUTH_TOKEN"
   rbac:
     enabled: false
+    store_path: "./data/rbac.acold" # Local native append-only binary persistence
     roles:
       - name: "model_reader"
         rules:
