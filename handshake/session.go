@@ -4,6 +4,9 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"os"
+	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/rachmanzz/anchor-connector/wire"
@@ -25,11 +28,15 @@ const (
 	StateReady
 )
 
-// ClientHandshaker executes the AnchorWire protocol handshake over a raw TCP connection.
+// ClientHandshaker executes the AnchorWire protocol handshake over a raw TCP connection,
+// supporting Solusi B (OTK -> Session Key) and Solusi C (Pairing Window).
 type ClientHandshaker struct {
-	authToken   string
-	modelName   string
-	timeout     time.Duration
+	nodeID          string
+	authToken       string
+	sessionFilePath string
+	sessionKey      string
+	modelName       string
+	timeout         time.Duration
 }
 
 // NewClientHandshaker creates a handshaker for a client session.
@@ -38,10 +45,58 @@ func NewClientHandshaker(authToken, modelName string, timeout time.Duration) *Cl
 		timeout = 2 * time.Second
 	}
 	return &ClientHandshaker{
-		authToken: authToken,
-		modelName: modelName,
-		timeout:   timeout,
+		nodeID:          "anchor-connector",
+		authToken:       authToken,
+		sessionFilePath: "./data/connector_session.key",
+		modelName:       modelName,
+		timeout:         timeout,
 	}
+}
+
+// SetNodeID sets the unique identifier of this connector node.
+func (h *ClientHandshaker) SetNodeID(nodeID string) {
+	if nodeID != "" {
+		h.nodeID = nodeID
+	}
+}
+
+// SetSessionFilePath configures the local file path for caching issued session keys.
+func (h *ClientHandshaker) SetSessionFilePath(path string) {
+	h.sessionFilePath = path
+}
+
+// SessionKey returns the currently active cached session key.
+func (h *ClientHandshaker) SessionKey() string {
+	return h.sessionKey
+}
+
+// LoadSavedSessionKey attempts to read a previously issued session key from disk.
+func (h *ClientHandshaker) LoadSavedSessionKey() (string, error) {
+	if h.sessionFilePath == "" {
+		return "", errors.New("handshake: no session file path configured")
+	}
+	data, err := os.ReadFile(h.sessionFilePath)
+	if err != nil {
+		return "", err
+	}
+	key := strings.TrimSpace(string(data))
+	if key == "" {
+		return "", errors.New("handshake: session key file is empty")
+	}
+	h.sessionKey = key
+	return key, nil
+}
+
+// SaveSessionKey writes the issued session key to the local session file.
+func (h *ClientHandshaker) SaveSessionKey(key string) error {
+	if h.sessionFilePath == "" || key == "" {
+		return nil
+	}
+	if err := os.MkdirAll(filepath.Dir(h.sessionFilePath), 0755); err != nil {
+		return fmt.Errorf("handshake: failed to create session dir: %w", err)
+	}
+	h.sessionKey = key
+	return os.WriteFile(h.sessionFilePath, []byte(key), 0600)
 }
 
 // PerformHandshake steps through OpAuth, OpSelectModel, and OpPing over the net.Conn.
@@ -53,31 +108,62 @@ func (h *ClientHandshaker) PerformHandshake(conn net.Conn) (SessionState, error)
 
 	state := StateConnected
 
-	// 1. Authentication (OpAuth 0x03) if token is provided
-	if h.authToken != "" {
-		authFrame := wire.Frame{
-			Magic:   wire.Magic,
-			Version: wire.Version,
-			OpCode:  wire.OpAuth,
-			Seq:     1,
-			Payload: wire.EncodeAuthPayload(h.authToken),
-		}
-		if err := wire.WriteFrame(conn, authFrame); err != nil {
-			return state, fmt.Errorf("failed to send OpAuth: %w", err)
-		}
+	// 1. Prepare Authentication Payload (Solusi B, Solusi C, or Static)
+	var authReq wire.AuthRequest
+	authReq.NodeID = h.nodeID
 
-		resp, err := wire.ReadFrame(conn)
-		if err != nil {
-			return state, fmt.Errorf("failed to read OpAuth response: %w", err)
+	// Check for cached session key on disk or in memory
+	activeSession := h.sessionKey
+	if activeSession == "" && h.sessionFilePath != "" {
+		if saved, err := h.LoadSavedSessionKey(); err == nil {
+			activeSession = saved
 		}
-		if resp.OpCode == wire.OpResponseError {
-			code, msg, _ := wire.DecodeErrorPayload(resp.Payload)
-			return state, fmt.Errorf("%w: status %d (%s)", ErrAuthFailed, code, msg)
-		}
-		state = StateAuthenticated
-	} else {
-		state = StateAuthenticated
 	}
+
+	if activeSession != "" {
+		// Subsequent reconnect using valid session ticket
+		authReq.Type = wire.AuthTypeSession
+		authReq.Credential = activeSession
+	} else if h.authToken != "" {
+		// OTK token or static credential provided via env/config
+		if strings.HasPrefix(h.authToken, "ANCH.JOIN.") {
+			authReq.Type = wire.AuthTypeOTK
+		} else {
+			authReq.Type = wire.AuthTypeStatic
+		}
+		authReq.Credential = h.authToken
+	} else {
+		// Zero-config: attempt Solusi C (Pairing Window)
+		authReq.Type = wire.AuthTypePairing
+		authReq.Credential = ""
+	}
+
+	authFrame := wire.Frame{
+		Magic:   wire.Magic,
+		Version: wire.Version,
+		OpCode:  wire.OpAuth,
+		Seq:     1,
+		Payload: wire.EncodeStructuredAuth(authReq),
+	}
+
+	if err := wire.WriteFrame(conn, authFrame); err != nil {
+		return state, fmt.Errorf("failed to send OpAuth: %w", err)
+	}
+
+	resp, err := wire.ReadFrame(conn)
+	if err != nil {
+		return state, fmt.Errorf("failed to read OpAuth response: %w", err)
+	}
+	if resp.OpCode == wire.OpResponseError {
+		code, msg, _ := wire.DecodeErrorPayload(resp.Payload)
+		return state, fmt.Errorf("%w: status %d (%s)", ErrAuthFailed, code, msg)
+	}
+
+	// If backend issued a new SessionKey (Solusi B or C), persist it locally
+	if issuedKey, keyErr := wire.DecodeAuthResponse(resp.Payload); keyErr == nil && issuedKey != "" {
+		_ = h.SaveSessionKey(issuedKey)
+	}
+	state = StateAuthenticated
 
 	// 2. Select Model (OpSelectModel 0x04) if specified
 	if h.modelName != "" {
@@ -115,7 +201,7 @@ func (h *ClientHandshaker) PerformHandshake(conn net.Conn) (SessionState, error)
 		return state, fmt.Errorf("failed to send OpPing: %w", err)
 	}
 
-	resp, err := wire.ReadFrame(conn)
+	resp, err = wire.ReadFrame(conn)
 	if err != nil {
 		return state, fmt.Errorf("failed to read OpPong: %w", err)
 	}

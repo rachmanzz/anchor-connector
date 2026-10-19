@@ -172,10 +172,17 @@ func EncodeAuthPayload(token string) []byte {
 	return buf
 }
 
-// DecodeAuthPayload decodes a token payload for OpAuth.
+// DecodeAuthPayload decodes a token payload for OpAuth, supporting both structured and legacy formats.
 func DecodeAuthPayload(payload []byte) (string, error) {
 	if len(payload) < 2 {
 		return "", errors.New("malformed auth payload: too short")
+	}
+	if payload[0] == StructuredAuthMagic {
+		req, err := DecodeStructuredAuth(payload)
+		if err != nil {
+			return "", err
+		}
+		return req.Credential, nil
 	}
 	tokenLen := int(binary.LittleEndian.Uint16(payload[0:2]))
 	if len(payload) < 2+tokenLen {
