@@ -65,7 +65,7 @@ TCP Gateway, Persistent Connection Pool, Model Partition Router, and Local Binar
 ## 🛠️ Building & Running
 
 ### Requirements
-- Go 1.22+ (or Go 1.23+)
+- Go 1.26.0+ (tolerated/tested up to Go 1.27.2)
 - Linux / macOS / Windows
 
 ### Build Binary
