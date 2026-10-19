@@ -16,7 +16,9 @@ import (
 	"time"
 
 	"github.com/rachmanzz/anchor-connector/config"
+	"github.com/rachmanzz/anchor-connector/failover"
 	"github.com/rachmanzz/anchor-connector/pool"
+	"github.com/rachmanzz/anchor-connector/replication"
 	"github.com/rachmanzz/anchor-connector/router"
 	"github.com/rachmanzz/anchor-connector/security"
 	"github.com/rachmanzz/anchor-connector/wire"
@@ -24,19 +26,21 @@ import (
 
 // Server coordinates the binary AnchorWire TCP gateway and HTTP REST proxy.
 type Server struct {
-	cfg         *config.Config
-	router      *router.Router
-	pool        *pool.Pool
-	auth        *security.Authenticator
-	ipFilter    *security.IPFilter
-	tlsConfig   *tls.Config
-	wireLn      net.Listener
-	httpLn      net.Listener
-	httpServer  *http.Server
-	activeConns atomic.Int64
-	closed      atomic.Bool
-	stopChan    chan struct{}
-	wg          sync.WaitGroup
+	cfg              *config.Config
+	router           *router.Router
+	pool             *pool.Pool
+	auth             *security.Authenticator
+	ipFilter         *security.IPFilter
+	tlsConfig        *tls.Config
+	replicationCoord *replication.Coordinator
+	failoverCoord    *failover.FailoverCoordinator
+	wireLn           net.Listener
+	httpLn           net.Listener
+	httpServer       *http.Server
+	activeConns      atomic.Int64
+	closed           atomic.Bool
+	stopChan         chan struct{}
+	wg               sync.WaitGroup
 }
 
 // NewServer builds a configured Server ready to start listeners.
@@ -57,6 +61,16 @@ func NewServer(
 		tlsConfig: tlsCfg,
 		stopChan:  make(chan struct{}),
 	}
+}
+
+// SetReplicationCoordinator injects the quorum replication coordinator into the proxy.
+func (s *Server) SetReplicationCoordinator(rc *replication.Coordinator) {
+	s.replicationCoord = rc
+}
+
+// SetFailoverCoordinator injects the automated failover coordinator into the proxy.
+func (s *Server) SetFailoverCoordinator(fc *failover.FailoverCoordinator) {
+	s.failoverCoord = fc
 }
 
 // WireAddr returns the actual listening address of the wire gateway.
@@ -268,7 +282,7 @@ func (s *Server) handleClient(clientConn net.Conn) {
 		}
 
 		// Route data frame to backend AnchorDB node
-		targetNode, _, err := s.router.SelectTarget(sess.selectedModel, frame.OpCode, frame.Flags)
+		targetNode, role, err := s.router.SelectTarget(sess.selectedModel, frame.OpCode, frame.Flags)
 		if err != nil {
 			errResp := wire.Frame{
 				Magic:   wire.Magic,
@@ -281,9 +295,37 @@ func (s *Server) handleClient(clientConn net.Conn) {
 			continue
 		}
 
-		// Forward to backend persistent pool and return response
-		backendResp, err := s.pool.ExecuteFrame(targetNode, frame, readTimeout)
+		var backendResp wire.Frame
+		// If write mutation and replication coordinator is configured, execute via BroadcastMutation
+		if role == router.RolePrimary && s.replicationCoord != nil {
+			route, routeErr := s.router.GetRoute(sess.selectedModel)
+			if routeErr == nil && route != nil {
+				lsn := uint64(frame.Seq)
+				if lsn == 0 {
+					lsn = uint64(time.Now().UnixNano())
+				}
+				ctx, cancel := context.WithTimeout(context.Background(), readTimeout)
+				backendResp, err = s.replicationCoord.BroadcastMutation(ctx, route.Primary, route.Replicas, frame, lsn)
+				cancel()
+			} else {
+				backendResp, err = s.pool.ExecuteFrame(targetNode, frame, readTimeout)
+			}
+		} else {
+			backendResp, err = s.pool.ExecuteFrame(targetNode, frame, readTimeout)
+		}
+
 		if err != nil {
+			// If primary node encountered an error, attempt automated failover evaluation
+			if role == router.RolePrimary && s.failoverCoord != nil {
+				ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+				promoted, newPrimary, fErr := s.failoverCoord.EvaluateAndFailover(ctx, sess.selectedModel)
+				cancel()
+				if fErr == nil && promoted {
+					log.Printf("[anchor-connector] Automatic failover triggered for model '%s': new primary %s",
+						sess.selectedModel, newPrimary)
+				}
+			}
+
 			errResp := wire.Frame{
 				Magic:   wire.Magic,
 				Version: wire.Version,

@@ -10,7 +10,9 @@ import (
 	"time"
 
 	"github.com/rachmanzz/anchor-connector/config"
+	"github.com/rachmanzz/anchor-connector/failover"
 	"github.com/rachmanzz/anchor-connector/pool"
+	"github.com/rachmanzz/anchor-connector/replication"
 	"github.com/rachmanzz/anchor-connector/router"
 	"github.com/rachmanzz/anchor-connector/security"
 	"github.com/rachmanzz/anchor-connector/wire"
@@ -343,3 +345,117 @@ func TestProxy_EndToEnd(t *testing.T) {
 		}
 	})
 }
+
+func TestProxy_ReplicationAndFailoverIntegration(t *testing.T) {
+	primaryLn, primaryAddr := setupMockBackend(t)
+	defer primaryLn.Close()
+
+	replicaLn, replicaAddr := setupMockBackend(t)
+	defer replicaLn.Close()
+
+	cfg := &config.Config{
+		Gateway: config.GatewayConfig{
+			ListenWireAddr: "127.0.0.1:0",
+			ListenHTTPAddr: "127.0.0.1:0",
+			ReadTimeoutMS:  1000,
+			WriteTimeoutMS: 1000,
+		},
+		Security: config.SecurityConfig{
+			Auth: config.AuthConfig{
+				Mode: "none",
+			},
+		},
+		Routing: config.RoutingConfig{
+			DefaultCluster:      "default",
+			ModelResolutionMode: "strict",
+			Models: []config.ModelConfig{
+				{
+					Name:      "orders",
+					ClusterID: "default",
+					Primary:   primaryAddr,
+					Replicas:  []string{replicaAddr},
+				},
+			},
+		},
+		Pool: config.PoolConfig{
+			MinIdleConnections: 1,
+			MaxConnections:     4,
+			ConnectTimeoutMS:   500,
+			IdleTimeoutSeconds: 60,
+		},
+		Replication: config.ReplicationConfig{
+			DefaultMode:          "semi_sync",
+			QuorumSize:           1,
+			QuorumTimeoutMS:      500,
+			RingBufferCapacityMB: 8,
+			MaxToleratedLagMS:    2000,
+		},
+	}
+
+	r := router.NewRouter(cfg.Routing)
+	p := pool.NewPool(cfg.Pool)
+	defer p.Close()
+
+	repCoord := replication.NewCoordinator(cfg.Replication, p)
+	prober := failover.NewProber(p, 50*time.Millisecond, 100*time.Millisecond)
+	epochMgr := failover.NewEpochManager("default", "test-secret")
+	failoverCoord := failover.NewFailoverCoordinator(prober, epochMgr, r, p)
+
+	srv := NewServer(cfg, r, p, security.NewAuthenticator("none", ""), nil, nil)
+	srv.SetReplicationCoordinator(repCoord)
+	srv.SetFailoverCoordinator(failoverCoord)
+
+	if err := srv.Start(); err != nil {
+		t.Fatalf("failed to start proxy server: %v", err)
+	}
+	defer func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		_ = srv.Shutdown(ctx)
+	}()
+
+	conn, err := net.DialTimeout("tcp", srv.WireAddr(), time.Second)
+	if err != nil {
+		t.Fatalf("failed to dial wire server: %v", err)
+	}
+	defer conn.Close()
+
+	// 1. Select Model "orders"
+	selectFrame := wire.Frame{
+		Magic:   wire.Magic,
+		Version: wire.Version,
+		OpCode:  wire.OpSelectModel,
+		Seq:     1,
+		Payload: []byte("orders"),
+	}
+	if err := wire.WriteFrame(conn, selectFrame); err != nil {
+		t.Fatalf("write select model failed: %v", err)
+	}
+	selectResp, err := wire.ReadFrame(conn)
+	if err != nil || selectResp.OpCode != wire.OpResponseOK {
+		t.Fatalf("select model failed: %+v", selectResp)
+	}
+
+	// 2. Write Mutation OpSave via Proxy -> must trigger BroadcastMutation and RingBuffer push
+	saveFrame := wire.Frame{
+		Magic:   wire.Magic,
+		Version: wire.Version,
+		OpCode:  wire.OpSave,
+		Seq:     2,
+		Payload: []byte(`{"order_id":123,"total":99.9}`),
+	}
+	if err := wire.WriteFrame(conn, saveFrame); err != nil {
+		t.Fatalf("write save failed: %v", err)
+	}
+	saveResp, err := wire.ReadFrame(conn)
+	if err != nil || saveResp.OpCode != wire.OpResponseOK {
+		t.Fatalf("save failed: %+v", saveResp)
+	}
+
+	// Verify RingBuffer received the mutation
+	_, latestLSN, count := repCoord.RingBuffer().Bounds()
+	if count == 0 || latestLSN != 2 {
+		t.Fatalf("expected mutation in ring buffer, got count=%d latestLSN=%d", count, latestLSN)
+	}
+}
+

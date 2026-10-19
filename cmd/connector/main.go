@@ -12,8 +12,10 @@ import (
 	"time"
 
 	"github.com/rachmanzz/anchor-connector/config"
+	"github.com/rachmanzz/anchor-connector/failover"
 	"github.com/rachmanzz/anchor-connector/pool"
 	"github.com/rachmanzz/anchor-connector/proxy"
+	"github.com/rachmanzz/anchor-connector/replication"
 	"github.com/rachmanzz/anchor-connector/router"
 	"github.com/rachmanzz/anchor-connector/security"
 )
@@ -114,13 +116,34 @@ func main() {
 	r := router.NewRouter(cfg.Routing)
 	p := pool.NewPool(cfg.Pool)
 
-	// 7. Gateway Proxy Server
+	// 7. Replication Coordinator & Failover Prober
+	repCoord := replication.NewCoordinator(cfg.Replication, p)
+	prober := failover.NewProber(p, 500*time.Millisecond, 300*time.Millisecond)
+	epochMgr := failover.NewEpochManager(cfg.Routing.DefaultCluster, "anchor-fencing-secret")
+	failoverCoord := failover.NewFailoverCoordinator(prober, epochMgr, r, p)
+
+	// Register all model endpoints with active prober
+	for _, m := range cfg.Routing.Models {
+		if m.Primary != "" {
+			prober.RegisterNode(m.Primary)
+		}
+		for _, rep := range m.Replicas {
+			if rep != "" {
+				prober.RegisterNode(rep)
+			}
+		}
+	}
+	prober.Start()
+
+	// 8. Gateway Proxy Server
 	srv := proxy.NewServer(cfg, r, p, auth, ipFilter, tlsCfg)
+	srv.SetReplicationCoordinator(repCoord)
+	srv.SetFailoverCoordinator(failoverCoord)
 	if err := srv.Start(); err != nil {
 		log.Fatalf("[anchor-connector] FATAL: Failed to start gateway listeners: %v", err)
 	}
 
-	// 8. Print banner
+	// 9. Print banner
 	fmt.Println(Banner)
 	fmt.Printf(" Wire Gateway (TCP)   : %s\n", srv.WireAddr())
 	fmt.Printf(" HTTP Gateway (REST)  : %s\n", srv.HTTPAddr())
@@ -128,16 +151,20 @@ func main() {
 	fmt.Printf(" Authentication Mode  : %s\n", cfg.Security.Auth.Mode)
 	fmt.Printf(" IP Whitelist Enforced: %v\n", ipFilter.IsEnabled())
 	fmt.Printf(" Sharded Models Count : %d\n", len(cfg.Routing.Models))
+	fmt.Printf(" Replication Mode     : %s (Quorum: %d)\n", cfg.Replication.DefaultMode, cfg.Replication.QuorumSize)
+	fmt.Printf(" Failover Supervisor  : Active (Epoch Fencing Enabled)\n")
 	fmt.Printf(" Cold Storage (.acold): %v (Dir: %s)\n", cfg.ColdStorage.Enabled, cfg.ColdStorage.StorageDir)
 	fmt.Println("==============================================================")
 	log.Println("[anchor-connector] Gateway ready and accepting connections.")
 
-	// 9. Graceful shutdown handler
+	// 10. Graceful shutdown handler
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM, syscall.SIGINT)
 
 	sig := <-sigChan
 	log.Printf("[anchor-connector] Received signal %v, initiating graceful shutdown...", sig)
+
+	prober.Stop()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
