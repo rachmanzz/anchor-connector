@@ -84,6 +84,35 @@ func (r *Router) RegisterRoute(model string, primary string, replicas []string) 
 	}
 }
 
+// PromoteReplica atomically promotes newPrimary to be the primary node for model,
+// removing it from the replica list and optionally demoting the old primary.
+func (r *Router) PromoteReplica(model string, newPrimary string) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	route, exists := r.routes[model]
+	if !exists {
+		return ErrModelNotFound
+	}
+
+	oldPrimary := route.Primary
+	newReplicas := make([]string, 0, len(route.Replicas))
+
+	for _, rep := range route.Replicas {
+		if rep != newPrimary {
+			newReplicas = append(newReplicas, rep)
+		}
+	}
+	// Append old primary to replicas list if not already present
+	if oldPrimary != "" && oldPrimary != newPrimary {
+		newReplicas = append(newReplicas, oldPrimary)
+	}
+
+	route.Primary = newPrimary
+	route.Replicas = newReplicas
+	return nil
+}
+
 // GetRoute returns the routing table entry for a given model.
 func (r *Router) GetRoute(model string) (*ModelRoute, error) {
 	r.mu.RLock()

@@ -109,6 +109,9 @@ anchor-connector/
 ├── router/              # Model sharding, read/write splitting, round-robin
 ├── pool/                # Persistent backend TCP connection pooling (port 7448)
 ├── proxy/               # TCP binary gateway & HTTP REST transcoding server
+├── replication/         # Semi-sync quorum, in-memory ring buffer & LSN lag tracking
+├── failover/            # Active health prober, circuit breaker & HMAC epoch fencing
+├── handshake/           # One-Time Join Key (OTK) registry & protocol handshaker
 ├── coldstorage/         # Native .acold binary storage format & append engine
 ├── config.example.yaml  # Ready-to-use production configuration template
 └── go.mod
