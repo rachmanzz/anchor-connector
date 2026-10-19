@@ -87,6 +87,11 @@ go build -o bin/anchor-connector ./cmd/connector
   -auth-token my-secret-token
 ```
 
+### Run with Docker Compose
+```bash
+docker compose up --build -d
+```
+
 ---
 
 ## 🧪 Testing

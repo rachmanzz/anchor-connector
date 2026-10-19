@@ -157,7 +157,27 @@ func main() {
 	fmt.Println("==============================================================")
 	log.Println("[anchor-connector] Gateway ready and accepting connections.")
 
-	// 10. Graceful shutdown handler
+	// 10. SIGHUP hot configuration reload handler
+	hupChan := make(chan os.Signal, 1)
+	signal.Notify(hupChan, syscall.SIGHUP)
+	go func() {
+		for range hupChan {
+			log.Println("[anchor-connector] SIGHUP received, reloading configuration...")
+			if _, statErr := os.Stat(*configPath); statErr == nil {
+				newCfg, reloadErr := config.LoadConfig(*configPath)
+				if reloadErr != nil {
+					log.Printf("[anchor-connector] WARNING: Failed to reload config from %s: %v", *configPath, reloadErr)
+					continue
+				}
+				for _, m := range newCfg.Routing.Models {
+					r.RegisterRoute(m.Name, m.Primary, m.Replicas)
+				}
+				log.Printf("[anchor-connector] Configuration reloaded successfully (%d models updated).", len(newCfg.Routing.Models))
+			}
+		}
+	}()
+
+	// 11. Graceful shutdown handler
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM, syscall.SIGINT)
 

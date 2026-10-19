@@ -1,0 +1,24 @@
+version: "3.8"
+
+services:
+  anchor-connector:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: anchor-connector
+    restart: unless-stopped
+    ports:
+      - "7448:7448" # AnchorWire Binary TCP Gateway
+      - "7447:7447" # HTTP REST Transcoding Gateway
+    volumes:
+      - ./data/cold:/app/data/cold
+    environment:
+      - CONNECTOR_LISTEN_WIRE=0.0.0.0:7448
+      - CONNECTOR_LISTEN_HTTP=0.0.0.0:7447
+      - CONNECTOR_STORAGE_DIR=/app/data/cold
+    networks:
+      - anchor-net
+
+networks:
+  anchor-net:
+    driver: bridge
