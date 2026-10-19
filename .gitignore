@@ -24,3 +24,16 @@ Thumbs.db
 # Local knowledge base (all contents ignored without exception)
 .knowledges/
 .knowledges/**
+
+# AI Agent & Local Tooling
+.opencode/
+.opencode/**
+.agent/
+.agent/**
+.agents/
+.agents/**
+.codex/
+.codex/**
+AGENTS.md
+
+
