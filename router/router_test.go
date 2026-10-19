@@ -89,3 +89,47 @@ func TestReplicaRoundRobin(t *testing.T) {
 		t.Errorf("expected round robin distribution across different replicas: %s vs %s", target1, target2)
 	}
 }
+
+func TestComputeNodeRouting(t *testing.T) {
+	cfg := config.RoutingConfig{
+		Models: []config.ModelConfig{
+			{
+				Name:         "graph_model",
+				Primary:      "10.0.1.10:7448",
+				Replicas:     []string{"10.0.1.11:7448"},
+				ComputeNodes: []string{"10.0.1.20:7448", "10.0.1.21:7448"},
+			},
+		},
+	}
+
+	r := NewRouter(cfg)
+
+	// 1. Standard read -> routes to standard replica
+	t1, role1, err := r.SelectTarget("graph_model", wire.OpGet, wire.FlagNone)
+	if err != nil || role1 != RoleReplica || t1 != "10.0.1.11:7448" {
+		t.Fatalf("expected standard replica 10.0.1.11:7448, got target=%s role=%v err=%v", t1, role1, err)
+	}
+
+	// 2. Heavy compute (OpCausal, OpGraph, OpGraphChain) -> routes to ComputeNodes
+	c1, roleC1, err := r.SelectTarget("graph_model", wire.OpCausal, wire.FlagNone)
+	if err != nil || roleC1 != RoleCompute {
+		t.Fatalf("expected RoleCompute for OpCausal, got: %v", roleC1)
+	}
+	if c1 != "10.0.1.20:7448" && c1 != "10.0.1.21:7448" {
+		t.Fatalf("expected target in ComputeNodes, got: %s", c1)
+	}
+
+	c2, roleC2, err := r.SelectTarget("graph_model", wire.OpGraph, wire.FlagNone)
+	if err != nil || roleC2 != RoleCompute {
+		t.Fatalf("expected RoleCompute for OpGraph, got: %v", roleC2)
+	}
+	if c1 == c2 {
+		t.Errorf("expected compute round robin, got same target: %s", c1)
+	}
+
+	// 3. Mutating write -> still routes to Primary
+	w1, roleW, err := r.SelectTarget("graph_model", wire.OpSave, wire.FlagNone)
+	if err != nil || roleW != RolePrimary || w1 != "10.0.1.10:7448" {
+		t.Fatalf("expected Primary 10.0.1.10:7448 for OpSave, got target=%s role=%v", w1, roleW)
+	}
+}

@@ -11,7 +11,7 @@ import (
 )
 
 // startMockWireServer starts an in-memory TCP listener echoing OpPong to OpPing.
-func startMockWireServer(t *testing.T) (string, func()) {
+func startMockWireServer(t testing.TB) (string, func()) {
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("failed to listen: %v", err)
@@ -161,5 +161,43 @@ func TestPoolHandshake(t *testing.T) {
 
 	if !handshakeExecuted {
 		t.Fatal("expected handshake to be executed on new connection")
+	}
+}
+
+func TestPoolDrainNode(t *testing.T) {
+	serverAddr, cleanup := startMockWireServer(t)
+	defer cleanup()
+
+	p := NewPool(config.PoolConfig{
+		MinIdleConnections: 1,
+		MaxConnections:     5,
+		ConnectTimeoutMS:   1000,
+		IdleTimeoutSeconds: 60,
+	})
+	defer p.Close()
+
+	// 1. Acquire connection and return to pool
+	conn, err := p.Get(serverAddr)
+	if err != nil {
+		t.Fatalf("p.Get failed: %v", err)
+	}
+	p.Put(conn)
+
+	// Verify node exists in pool
+	p.mu.RLock()
+	_, exists := p.nodePools[serverAddr]
+	p.mu.RUnlock()
+	if !exists {
+		t.Fatalf("expected nodePool to exist for %s", serverAddr)
+	}
+
+	// 2. Drain node
+	p.DrainNode(serverAddr)
+
+	p.mu.RLock()
+	_, existsAfter := p.nodePools[serverAddr]
+	p.mu.RUnlock()
+	if existsAfter {
+		t.Fatalf("expected nodePool to be removed for %s after DrainNode", serverAddr)
 	}
 }

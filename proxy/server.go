@@ -323,6 +323,19 @@ func (s *Server) handleClient(clientConn net.Conn) {
 			continue
 		}
 
+		// Check adaptive backpressure
+		if s.router.Backpressure() != nil && s.router.Backpressure().IsThrottled() {
+			errResp := wire.Frame{
+				Magic:   wire.Magic,
+				Version: wire.Version,
+				OpCode:  wire.OpResponseError,
+				Seq:     frame.Seq,
+				Payload: wire.EncodeErrorPayload(503, "cluster memory pressure backpressure active"),
+			}
+			_ = wire.WriteFrame(clientConn, errResp)
+			continue
+		}
+
 		// Route data frame to backend AnchorDB node
 		targetNode, role, err := s.router.SelectTarget(sess.selectedModel, frame.OpCode, frame.Flags)
 		if err != nil {
@@ -377,6 +390,11 @@ func (s *Server) handleClient(clientConn net.Conn) {
 			}
 			_ = wire.WriteFrame(clientConn, errResp)
 			continue
+		}
+
+		// Inspect backend response flags for memory pressure
+		if s.router.Backpressure() != nil {
+			s.router.Backpressure().InspectResponseFlags(backendResp.Flags)
 		}
 
 		// Restore client sequence ID

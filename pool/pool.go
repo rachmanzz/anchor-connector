@@ -125,6 +125,20 @@ func (p *Pool) Put(conn *BackendConn) {
 	np.release(conn)
 }
 
+// DrainNode closes idle connections for addr and removes the node pool to prevent new re-pooling.
+func (p *Pool) DrainNode(addr string) {
+	p.mu.Lock()
+	np, exists := p.nodePools[addr]
+	if exists {
+		delete(p.nodePools, addr)
+	}
+	p.mu.Unlock()
+
+	if exists && np != nil {
+		np.closeAll()
+	}
+}
+
 // ExecuteFrame forwards a Frame to the backend address, waits for the response, and returns connection to pool.
 func (p *Pool) ExecuteFrame(addr string, req wire.Frame, readTimeout time.Duration) (wire.Frame, error) {
 	conn, err := p.Get(addr)

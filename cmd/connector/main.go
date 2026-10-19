@@ -164,10 +164,39 @@ func main() {
 				prober.RegisterNode(rep)
 			}
 		}
+		for _, cn := range m.ComputeNodes {
+			if cn != "" {
+				prober.RegisterNode(cn)
+			}
+		}
 	}
 	prober.Start()
 
-	// 8. Gateway Proxy Server
+	// 9. Topology Reconciler (Dynamic Service Discovery)
+	var reconciler *router.TopologyReconciler
+	hasDiscovery := false
+	for _, m := range cfg.Routing.Models {
+		if m.DiscoveryService != "" {
+			hasDiscovery = true
+			break
+		}
+	}
+	if hasDiscovery {
+		srvDiscovery := router.NewDNSSRVDiscovery(nil)
+		interval := time.Duration(cfg.Routing.DiscoveryIntervalMS) * time.Millisecond
+		if interval <= 0 {
+			interval = 5 * time.Second
+		}
+		reconciler = router.NewTopologyReconciler(r, p, srvDiscovery, interval)
+		for _, m := range cfg.Routing.Models {
+			if m.DiscoveryService != "" {
+				reconciler.RegisterModelService(m.Name, m.DiscoveryService)
+			}
+		}
+		reconciler.Start()
+	}
+
+	// 10. Gateway Proxy Server
 	srv := proxy.NewServer(cfg, r, p, auth, ipFilter, tlsCfg)
 	srv.SetReplicationCoordinator(repCoord)
 	srv.SetFailoverCoordinator(failoverCoord)
@@ -175,7 +204,7 @@ func main() {
 		log.Fatalf("[anchor-connector] FATAL: Failed to start gateway listeners: %v", err)
 	}
 
-	// 9. Print banner
+	// 11. Print banner
 	fmt.Println(Banner)
 	fmt.Printf(" Wire Gateway (TCP)   : %s\n", srv.WireAddr())
 	fmt.Printf(" HTTP Gateway (REST)  : %s\n", srv.HTTPAddr())
@@ -189,7 +218,7 @@ func main() {
 	fmt.Println("==============================================================")
 	log.Println("[anchor-connector] Gateway ready and accepting connections.")
 
-	// 10. SIGHUP hot configuration reload handler
+	// 12. SIGHUP hot configuration reload handler
 	hupChan := make(chan os.Signal, 1)
 	signal.Notify(hupChan, syscall.SIGHUP)
 	go func() {
@@ -202,14 +231,17 @@ func main() {
 					continue
 				}
 				for _, m := range newCfg.Routing.Models {
-					r.RegisterRoute(m.Name, m.Primary, m.Replicas)
+					r.RegisterRouteWithCompute(m.Name, m.Primary, m.Replicas, m.ComputeNodes)
+					if reconciler != nil && m.DiscoveryService != "" {
+						reconciler.RegisterModelService(m.Name, m.DiscoveryService)
+					}
 				}
 				log.Printf("[anchor-connector] Configuration reloaded successfully (%d models updated).", len(newCfg.Routing.Models))
 			}
 		}
 	}()
 
-	// 11. Graceful shutdown handler
+	// 13. Graceful shutdown handler
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM, syscall.SIGINT)
 
@@ -217,6 +249,9 @@ func main() {
 	log.Printf("[anchor-connector] Received signal %v, initiating graceful shutdown...", sig)
 
 	prober.Stop()
+	if reconciler != nil {
+		reconciler.Stop()
+	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()

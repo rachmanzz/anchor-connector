@@ -66,19 +66,22 @@ type PoolConfig struct {
 	IdleTimeoutSeconds int `yaml:"idle_timeout_seconds"`
 }
 
-// ModelConfig maps a single model to its Primary and Replica nodes.
+// ModelConfig maps a single model to its Primary, Replica, and Compute nodes.
 type ModelConfig struct {
-	Name      string   `yaml:"name"`
-	ClusterID string   `yaml:"cluster_id"`
-	Primary   string   `yaml:"primary"`
-	Replicas  []string `yaml:"replicas"`
-	MaxQPS    int      `yaml:"max_qps"`
+	Name             string   `yaml:"name"`
+	ClusterID        string   `yaml:"cluster_id"`
+	Primary          string   `yaml:"primary"`
+	Replicas         []string `yaml:"replicas"`
+	ComputeNodes     []string `yaml:"compute_nodes"`
+	DiscoveryService string   `yaml:"discovery_service"`
+	MaxQPS           int      `yaml:"max_qps"`
 }
 
 // RoutingConfig defines model sharding and cluster resolution.
 type RoutingConfig struct {
 	DefaultCluster      string        `yaml:"default_cluster"`
 	ModelResolutionMode string        `yaml:"model_resolution_mode"` // "strict" or "dynamic"
+	DiscoveryIntervalMS int           `yaml:"discovery_interval_ms"`
 	Models              []ModelConfig `yaml:"models"`
 }
 

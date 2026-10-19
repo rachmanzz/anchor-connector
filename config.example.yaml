@@ -30,11 +30,14 @@ pool:
 routing:
   default_cluster: "default"
   model_resolution_mode: "strict" # "strict" or "dynamic"
+  discovery_interval_ms: 5000
   models:
     - name: "default"
       cluster_id: "cluster-primary"
       primary: "127.0.0.1:7448"
       replicas: []
+      compute_nodes: []
+      discovery_service: "" # e.g. "tasks.anchordb_replica" for DNS SRV discovery
       max_qps: 10000
 
 replication:
