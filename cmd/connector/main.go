@@ -14,6 +14,7 @@ import (
 
 	"github.com/rachmanzz/anchor-connector/coldstorage"
 	"github.com/rachmanzz/anchor-connector/config"
+	"github.com/rachmanzz/anchor-connector/discovery"
 	"github.com/rachmanzz/anchor-connector/failover"
 	"github.com/rachmanzz/anchor-connector/handshake"
 	"github.com/rachmanzz/anchor-connector/pool"
@@ -196,10 +197,12 @@ func main() {
 		reconciler.Start()
 	}
 
-	// 10. Gateway Proxy Server
+	// 10. Gateway Proxy Server & Drain Controller
+	drainCtrl := discovery.NewDrainController()
 	srv := proxy.NewServer(cfg, r, p, auth, ipFilter, tlsCfg)
 	srv.SetReplicationCoordinator(repCoord)
 	srv.SetFailoverCoordinator(failoverCoord)
+	srv.SetDrainController(drainCtrl)
 	if err := srv.Start(); err != nil {
 		log.Fatalf("[anchor-connector] FATAL: Failed to start gateway listeners: %v", err)
 	}

@@ -1,0 +1,93 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: anchor-connector
+  namespace: anchordb
+  labels:
+    app.kubernetes.io/name: anchor-connector
+spec:
+  replicas: 2
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: anchor-connector
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: anchor-connector
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "7447"
+        prometheus.io/path: "/metrics"
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+      containers:
+        - name: anchor-connector
+          image: ghcr.io/rachmanzz/anchor-connector:latest
+          imagePullPolicy: IfNotPresent
+          args:
+            - "-config"
+            - "/etc/anchor-connector/config.yaml"
+          env:
+            - name: CONNECTOR_AUTH_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: anchor-connector-secrets
+                  key: CONNECTOR_AUTH_TOKEN
+          ports:
+            - containerPort: 7448
+              name: wire
+              protocol: TCP
+            - containerPort: 7447
+              name: http
+              protocol: TCP
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 1000m
+              memory: 512Mi
+          securityContext:
+            readOnlyRootFilesystem: false
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 7447
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 7447
+            initialDelaySeconds: 3
+            periodSeconds: 5
+            timeoutSeconds: 2
+            successThreshold: 1
+            failureThreshold: 2
+          volumeMounts:
+            - name: config-volume
+              mountPath: /etc/anchor-connector
+              readOnly: true
+            - name: cold-storage-volume
+              mountPath: /app/data/cold
+      volumes:
+        - name: config-volume
+          configMap:
+            name: anchor-connector-config
+        - name: cold-storage-volume
+          emptyDir: {}

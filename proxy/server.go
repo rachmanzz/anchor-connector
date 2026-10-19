@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/rachmanzz/anchor-connector/config"
+	"github.com/rachmanzz/anchor-connector/discovery"
 	"github.com/rachmanzz/anchor-connector/failover"
 	"github.com/rachmanzz/anchor-connector/handshake"
 	"github.com/rachmanzz/anchor-connector/metrics"
@@ -36,6 +37,7 @@ type Server struct {
 	tlsConfig        *tls.Config
 	replicationCoord *replication.Coordinator
 	failoverCoord    *failover.FailoverCoordinator
+	drainCtrl        *discovery.DrainController
 	wireLn           net.Listener
 	httpLn           net.Listener
 	httpServer       *http.Server
@@ -97,6 +99,16 @@ func (s *Server) SetFailoverCoordinator(fc *failover.FailoverCoordinator) {
 	s.failoverCoord = fc
 }
 
+// SetDrainController injects the node drain controller into the proxy.
+func (s *Server) SetDrainController(dc *discovery.DrainController) {
+	s.drainCtrl = dc
+}
+
+// DrainController returns the injected drain controller if configured.
+func (s *Server) DrainController() *discovery.DrainController {
+	return s.drainCtrl
+}
+
 // WireAddr returns the actual listening address of the wire gateway.
 func (s *Server) WireAddr() string {
 	if s.wireLn != nil {
@@ -140,6 +152,9 @@ func (s *Server) Start() error {
 	mux.HandleFunc("/api/v1/cluster/topology", s.handleHTTPClusterTopology)
 	mux.HandleFunc("/api/v1/replication/lag", s.handleHTTPReplicationLag)
 	mux.HandleFunc("/api/v1/storage/overview", s.handleHTTPStorageOverview)
+	mux.HandleFunc("/api/v1/admin/nodes/drain", s.handleHTTPAdminDrain)
+	mux.HandleFunc("/api/v1/admin/nodes/uncordon", s.handleHTTPAdminUncordon)
+	mux.HandleFunc("/api/v1/admin/draining", s.handleHTTPAdminDraining)
 	mux.HandleFunc("/metrics", s.handlePrometheusMetrics)
 
 	s.httpServer = &http.Server{
@@ -649,6 +664,139 @@ func (s *Server) handlePrometheusMetrics(w http.ResponseWriter, r *http.Request)
 	}
 
 	metrics.DefaultRegistry.WritePrometheus(w)
+}
+
+// adminDrainRequest represents the JSON payload to initiate node draining.
+type adminDrainRequest struct {
+	Address       string `json:"address"`
+	GracePeriodMS int64  `json:"grace_period_ms"`
+}
+
+// HTTP Admin Drain Node handler: cordons the node and gracefully drains pooled connections.
+func (s *Server) handleHTTPAdminDrain(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	if r.Method != http.MethodPost {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		_ = json.NewEncoder(w).Encode(map[string]string{"error": "method not allowed"})
+		return
+	}
+	if s.drainCtrl == nil {
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_ = json.NewEncoder(w).Encode(map[string]string{"error": "drain controller not configured"})
+		return
+	}
+
+	var req adminDrainRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		w.WriteHeader(http.StatusBadRequest)
+		_ = json.NewEncoder(w).Encode(map[string]string{"error": "invalid json payload: " + err.Error()})
+		return
+	}
+
+	if req.Address == "" {
+		w.WriteHeader(http.StatusBadRequest)
+		_ = json.NewEncoder(w).Encode(map[string]string{"error": "address is required"})
+		return
+	}
+
+	gracePeriod := 5 * time.Second
+	if req.GracePeriodMS > 0 {
+		gracePeriod = time.Duration(req.GracePeriodMS) * time.Millisecond
+	}
+
+	var drainFn func(string)
+	if s.pool != nil {
+		drainFn = s.pool.DrainNode
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), gracePeriod+5*time.Second)
+	defer cancel()
+
+	if err := s.drainCtrl.DrainNode(ctx, req.Address, gracePeriod, drainFn); err != nil {
+		if errors.Is(err, discovery.ErrNodeAlreadyDraining) {
+			w.WriteHeader(http.StatusConflict)
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+			return
+		}
+		w.WriteHeader(http.StatusInternalServerError)
+		_ = json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+		return
+	}
+
+	w.WriteHeader(http.StatusOK)
+	_ = json.NewEncoder(w).Encode(map[string]interface{}{
+		"status":  "ok",
+		"address": req.Address,
+		"drained": true,
+	})
+}
+
+// adminUncordonRequest represents the JSON payload to uncordon a node.
+type adminUncordonRequest struct {
+	Address string `json:"address"`
+}
+
+// HTTP Admin Uncordon Node handler: removes cordon state and re-enables traffic routing.
+func (s *Server) handleHTTPAdminUncordon(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	if r.Method != http.MethodPost {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		_ = json.NewEncoder(w).Encode(map[string]string{"error": "method not allowed"})
+		return
+	}
+	if s.drainCtrl == nil {
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_ = json.NewEncoder(w).Encode(map[string]string{"error": "drain controller not configured"})
+		return
+	}
+
+	var req adminUncordonRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		w.WriteHeader(http.StatusBadRequest)
+		_ = json.NewEncoder(w).Encode(map[string]string{"error": "invalid json payload: " + err.Error()})
+		return
+	}
+
+	if req.Address == "" {
+		w.WriteHeader(http.StatusBadRequest)
+		_ = json.NewEncoder(w).Encode(map[string]string{"error": "address is required"})
+		return
+	}
+
+	s.drainCtrl.Uncordon(req.Address)
+
+	w.WriteHeader(http.StatusOK)
+	_ = json.NewEncoder(w).Encode(map[string]interface{}{
+		"status":     "ok",
+		"address":    req.Address,
+		"uncordoned": true,
+	})
+}
+
+// HTTP Admin Draining List handler: returns all nodes currently under cordon or drained state.
+func (s *Server) handleHTTPAdminDraining(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	if r.Method != http.MethodGet {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		_ = json.NewEncoder(w).Encode(map[string]string{"error": "method not allowed"})
+		return
+	}
+
+	if s.drainCtrl == nil {
+		w.WriteHeader(http.StatusOK)
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+			"status":         "ok",
+			"draining_nodes": []discovery.DrainState{},
+		})
+		return
+	}
+
+	states := s.drainCtrl.ActiveDrainStates()
+	w.WriteHeader(http.StatusOK)
+	_ = json.NewEncoder(w).Encode(map[string]interface{}{
+		"status":         "ok",
+		"draining_nodes": states,
+	})
 }
 
 // Shutdown initiates graceful termination of both TCP and HTTP services.

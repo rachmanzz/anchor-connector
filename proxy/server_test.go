@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/rachmanzz/anchor-connector/config"
+	"github.com/rachmanzz/anchor-connector/discovery"
 	"github.com/rachmanzz/anchor-connector/failover"
 	"github.com/rachmanzz/anchor-connector/pool"
 	"github.com/rachmanzz/anchor-connector/replication"
@@ -525,4 +526,164 @@ func TestProxy_ReplicationAndFailoverIntegration(t *testing.T) {
 	if count == 0 || latestLSN != 2 {
 		t.Fatalf("expected mutation in ring buffer, got count=%d latestLSN=%d", count, latestLSN)
 	}
+}
+
+func TestProxy_AdminDrainEndpoints(t *testing.T) {
+	cfg := &config.Config{
+		Gateway: config.GatewayConfig{
+			ListenWireAddr: "127.0.0.1:0",
+			ListenHTTPAddr: "127.0.0.1:0",
+			ReadTimeoutMS:  1000,
+			WriteTimeoutMS: 1000,
+		},
+		Security: config.SecurityConfig{
+			Auth: config.AuthConfig{
+				Mode: "none",
+			},
+		},
+		Routing: config.RoutingConfig{
+			DefaultCluster: "default",
+			Models: []config.ModelConfig{
+				{
+					Name:      "test_model",
+					ClusterID: "default",
+					Primary:   "127.0.0.1:7001",
+					Replicas:  []string{"127.0.0.1:7002", "127.0.0.1:7003"},
+				},
+			},
+		},
+		Pool: config.PoolConfig{
+			MaxConnections:   5,
+			ConnectTimeoutMS: 500,
+		},
+	}
+
+	r := router.NewRouter(cfg.Routing)
+	p := pool.NewPool(cfg.Pool)
+	drainCtrl := discovery.NewDrainController()
+
+	srv := NewServer(cfg, r, p, security.NewAuthenticator("none", ""), nil, nil)
+	srv.SetDrainController(drainCtrl)
+
+	if err := srv.Start(); err != nil {
+		t.Fatalf("failed to start proxy server: %v", err)
+	}
+	defer func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		_ = srv.Shutdown(ctx)
+	}()
+
+	client := &http.Client{Timeout: 2 * time.Second}
+	baseURL := "http://" + srv.HTTPAddr()
+
+	// 1. Initial GET /api/v1/admin/draining -> empty list
+	resp, err := client.Get(baseURL + "/api/v1/admin/draining")
+	if err != nil {
+		t.Fatalf("GET /api/v1/admin/draining failed: %v", err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 OK, got %d", resp.StatusCode)
+	}
+	var drainListResp struct {
+		Status        string                 `json:"status"`
+		DrainingNodes []discovery.DrainState `json:"draining_nodes"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&drainListResp); err != nil {
+		resp.Body.Close()
+		t.Fatalf("failed to decode response: %v", err)
+	}
+	resp.Body.Close()
+	if len(drainListResp.DrainingNodes) != 0 {
+		t.Fatalf("expected 0 draining nodes, got %d", len(drainListResp.DrainingNodes))
+	}
+
+	// 2. POST /api/v1/admin/nodes/drain with node 127.0.0.1:7002
+	targetNode := "127.0.0.1:7002"
+	drainPayload := strings.NewReader(`{"address": "127.0.0.1:7002", "grace_period_ms": 50}`)
+	resp, err = client.Post(baseURL+"/api/v1/admin/nodes/drain", "application/json", drainPayload)
+	if err != nil {
+		t.Fatalf("POST /api/v1/admin/nodes/drain failed: %v", err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		t.Fatalf("expected 200 OK, got %d: %s", resp.StatusCode, string(body))
+	}
+	var drainResult struct {
+		Status  string `json:"status"`
+		Address string `json:"address"`
+		Drained bool   `json:"drained"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&drainResult); err != nil {
+		resp.Body.Close()
+		t.Fatalf("failed to decode drain response: %v", err)
+	}
+	resp.Body.Close()
+
+	if drainResult.Address != targetNode || !drainResult.Drained {
+		t.Fatalf("unexpected drain result: %+v", drainResult)
+	}
+
+	// 3. GET /api/v1/admin/draining -> node is cordoned and drained
+	resp, err = client.Get(baseURL + "/api/v1/admin/draining")
+	if err != nil {
+		t.Fatalf("GET draining failed: %v", err)
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&drainListResp); err != nil {
+		resp.Body.Close()
+		t.Fatalf("failed to decode: %v", err)
+	}
+	resp.Body.Close()
+	if len(drainListResp.DrainingNodes) != 1 || drainListResp.DrainingNodes[0].Address != targetNode {
+		t.Fatalf("expected 1 draining node %s, got: %+v", targetNode, drainListResp.DrainingNodes)
+	}
+	if !drainListResp.DrainingNodes[0].Drained {
+		t.Fatalf("expected node to be marked as drained")
+	}
+
+	// 4. POST /api/v1/admin/nodes/uncordon -> restores node
+	uncordonPayload := strings.NewReader(`{"address": "127.0.0.1:7002"}`)
+	resp, err = client.Post(baseURL+"/api/v1/admin/nodes/uncordon", "application/json", uncordonPayload)
+	if err != nil {
+		t.Fatalf("POST uncordon failed: %v", err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		resp.Body.Close()
+		t.Fatalf("expected 200 OK on uncordon, got %d", resp.StatusCode)
+	}
+	resp.Body.Close()
+
+	// 5. GET /api/v1/admin/draining -> empty list again
+	resp, err = client.Get(baseURL + "/api/v1/admin/draining")
+	if err != nil {
+		t.Fatalf("GET draining failed: %v", err)
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&drainListResp); err != nil {
+		resp.Body.Close()
+		t.Fatalf("failed to decode: %v", err)
+	}
+	resp.Body.Close()
+	if len(drainListResp.DrainingNodes) != 0 {
+		t.Fatalf("expected 0 draining nodes after uncordon, got %d", len(drainListResp.DrainingNodes))
+	}
+
+	// 6. Error cases: empty address or invalid method
+	resp, err = client.Post(baseURL+"/api/v1/admin/nodes/drain", "application/json", strings.NewReader(`{}`))
+	if err != nil {
+		t.Fatalf("POST empty address failed: %v", err)
+	}
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("expected 400 Bad Request, got %d", resp.StatusCode)
+	}
+	resp.Body.Close()
+
+	resp, err = client.Get(baseURL + "/api/v1/admin/nodes/drain")
+	if err != nil {
+		t.Fatalf("GET drain failed: %v", err)
+	}
+	if resp.StatusCode != http.StatusMethodNotAllowed {
+		t.Fatalf("expected 405 Method Not Allowed, got %d", resp.StatusCode)
+	}
+	resp.Body.Close()
 }

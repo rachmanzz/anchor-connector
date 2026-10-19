@@ -1,0 +1,63 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: anchor-connector-config
+  namespace: anchordb
+  labels:
+    app.kubernetes.io/name: anchor-connector
+data:
+  config.yaml: |
+    gateway:
+      listen_wire_addr: "0.0.0.0:7448"
+      listen_http_addr: "0.0.0.0:7447"
+      read_timeout_ms: 5000
+      write_timeout_ms: 5000
+      idle_timeout_ms: 60000
+      max_connections: 50000
+
+    security:
+      tls:
+        enabled: false
+      auth:
+        mode: "token"
+        static_token: "env:CONNECTOR_AUTH_TOKEN"
+      allowed_backend_ips:
+        - "0.0.0.0/0"
+
+    pool:
+      min_idle_connections: 8
+      max_connections: 64
+      connect_timeout_ms: 2000
+      idle_timeout_seconds: 60
+      multiplexing_enabled: true
+      max_in_flight_per_connection: 100
+
+    routing:
+      default_cluster: "anchordb-cluster"
+      model_resolution_mode: "strict"
+      discovery_interval_ms: 3000
+      models:
+        - name: "default"
+          cluster_id: "anchordb-cluster"
+          primary: "anchordb-primary.anchordb.svc.cluster.local:7448"
+          replicas:
+            - "anchordb-replica-0.anchordb-replicas.anchordb.svc.cluster.local:7448"
+            - "anchordb-replica-1.anchordb-replicas.anchordb.svc.cluster.local:7448"
+          compute_nodes:
+            - "anchordb-compute.anchordb.svc.cluster.local:7448"
+          discovery_service: ""
+          max_qps: 20000
+
+    replication:
+      default_mode: "semi_sync"
+      quorum_size: 1
+      quorum_timeout_ms: 1000
+      ring_buffer_capacity_mb: 128
+      max_tolerated_lag_ms: 2000
+
+    cold_storage:
+      enabled: true
+      storage_dir: "/app/data/cold"
+      max_file_size_mb: 512
+      sync_strategy: "interval"
+      fsync_interval_seconds: 5

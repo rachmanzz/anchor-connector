@@ -1,0 +1,58 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: anchor-connector
+  namespace: anchordb
+  labels:
+    app.kubernetes.io/name: anchor-connector
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: anchor-connector
+  ports:
+    - name: wire
+      port: 7448
+      targetPort: 7448
+      protocol: TCP
+    - name: http
+      port: 7447
+      targetPort: 7447
+      protocol: TCP
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: anchor-connector-metrics
+  namespace: anchordb
+  labels:
+    app.kubernetes.io/name: anchor-connector
+  annotations:
+    prometheus.io/scrape: "true"
+    prometheus.io/port: "7447"
+    prometheus.io/path: "/metrics"
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: anchor-connector
+  ports:
+    - name: metrics
+      port: 7447
+      targetPort: 7447
+      protocol: TCP
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: anchordb-replicas
+  namespace: anchordb
+  labels:
+    app.kubernetes.io/name: anchordb-replica
+spec:
+  clusterIP: None
+  selector:
+    app.kubernetes.io/name: anchordb-replica
+  ports:
+    - name: wire
+      port: 7448
+      targetPort: 7448
+      protocol: TCP
