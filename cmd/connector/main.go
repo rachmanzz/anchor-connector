@@ -11,6 +11,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/rachmanzz/anchor-connector/coldstorage"
 	"github.com/rachmanzz/anchor-connector/config"
 	"github.com/rachmanzz/anchor-connector/failover"
 	"github.com/rachmanzz/anchor-connector/pool"
@@ -116,8 +117,17 @@ func main() {
 	r := router.NewRouter(cfg.Routing)
 	p := pool.NewPool(cfg.Pool)
 
-	// 7. Replication Coordinator & Failover Prober
+	// 7. Cold Storage Manager
+	coldMgr, err := coldstorage.NewManager(cfg.ColdStorage)
+	if err != nil {
+		log.Fatalf("[anchor-connector] FATAL: Failed to initialize cold storage: %v", err)
+	}
+
+	// 8. Replication Coordinator & Failover Prober
 	repCoord := replication.NewCoordinator(cfg.Replication, p)
+	if cfg.ColdStorage.Enabled {
+		repCoord.SetColdStorage(coldMgr)
+	}
 	prober := failover.NewProber(p, 500*time.Millisecond, 300*time.Millisecond)
 	epochMgr := failover.NewEpochManager(cfg.Routing.DefaultCluster, "anchor-fencing-secret")
 	failoverCoord := failover.NewFailoverCoordinator(prober, epochMgr, r, p)
@@ -191,6 +201,10 @@ func main() {
 
 	if err := srv.Shutdown(ctx); err != nil {
 		log.Printf("[anchor-connector] Warning during shutdown: %v", err)
+	}
+
+	if coldMgr != nil {
+		_ = coldMgr.Close()
 	}
 
 	log.Println("[anchor-connector] Shutdown completed cleanly. Goodbye.")

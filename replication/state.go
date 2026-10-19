@@ -187,3 +187,15 @@ func (lt *LagTracker) GetLagMatrix() map[string]ReplicaReplicationState {
 	}
 	return matrix
 }
+
+// ReplicaAckLSN returns the acknowledged LSN for a given replica.
+func (lt *LagTracker) ReplicaAckLSN(replicaID string) uint64 {
+	lt.mu.RLock()
+	defer lt.mu.RUnlock()
+
+	if state, exists := lt.replicas[replicaID]; exists {
+		return state.AckLSN
+	}
+	return 0
+}
+

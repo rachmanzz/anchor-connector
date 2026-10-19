@@ -305,7 +305,7 @@ func (s *Server) handleClient(clientConn net.Conn) {
 					lsn = uint64(time.Now().UnixNano())
 				}
 				ctx, cancel := context.WithTimeout(context.Background(), readTimeout)
-				backendResp, err = s.replicationCoord.BroadcastMutation(ctx, route.Primary, route.Replicas, frame, lsn)
+				backendResp, err = s.replicationCoord.BroadcastMutation(ctx, route.Primary, route.Replicas, frame, lsn, sess.selectedModel)
 				cancel()
 			} else {
 				backendResp, err = s.pool.ExecuteFrame(targetNode, frame, readTimeout)

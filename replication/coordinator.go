@@ -8,6 +8,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/rachmanzz/anchor-connector/coldstorage"
 	"github.com/rachmanzz/anchor-connector/config"
 	"github.com/rachmanzz/anchor-connector/pool"
 	"github.com/rachmanzz/anchor-connector/wire"
@@ -23,6 +24,7 @@ type Coordinator struct {
 	pool       *pool.Pool
 	ringBuffer *RingBuffer
 	lagTracker *LagTracker
+	coldStore  *coldstorage.Manager
 }
 
 // NewCoordinator creates a configured replication coordinator.
@@ -55,13 +57,25 @@ func (c *Coordinator) LagTracker() *LagTracker {
 	return c.lagTracker
 }
 
+// SetColdStorage registers the cold storage manager for tiered persistence and catchup.
+func (c *Coordinator) SetColdStorage(cs *coldstorage.Manager) {
+	c.coldStore = cs
+}
+
+// ColdStorage returns the underlying cold storage manager.
+func (c *Coordinator) ColdStorage() *coldstorage.Manager {
+	return c.coldStore
+}
+
 // BroadcastMutation writes to the Primary node and replicates to all replicas according to mode.
+// An optional model name can be supplied to partition cold storage persistence.
 func (c *Coordinator) BroadcastMutation(
 	ctx context.Context,
 	primaryNode string,
 	replicas []string,
 	frame wire.Frame,
 	lsn uint64,
+	model ...string,
 ) (wire.Frame, error) {
 	// Register all replica addresses in lag tracker
 	for _, replica := range replicas {
@@ -85,6 +99,17 @@ func (c *Coordinator) BroadcastMutation(
 	// Update local primary commit LSN and buffer the mutation
 	c.lagTracker.SetPrimaryCommitLSN(lsn)
 	c.ringBuffer.Push(lsn, frame)
+
+	// Persist to Cold Storage tier if enabled
+	if c.coldStore != nil {
+		modelName := "default"
+		if len(model) > 0 && model[0] != "" {
+			modelName = model[0]
+		}
+		if err := c.coldStore.Append(modelName, lsn, frame.OpCode, frame.Payload); err != nil {
+			log.Printf("[anchor-connector] cold storage append error for model '%s' (LSN %d): %v", modelName, lsn, err)
+		}
+	}
 
 	// If no replicas are configured, return immediately
 	if len(replicas) == 0 {
@@ -177,36 +202,123 @@ func (c *Coordinator) replicateAsync(replicas []string, frame wire.Frame, lsn ui
 	}
 }
 
-// CatchUpReplica streams missing LSN mutations from the RingBuffer to a lagging replica.
-func (c *Coordinator) CatchUpReplica(ctx context.Context, replicaAddr string, fromLSN, toLSN uint64) error {
-	entries, err := c.ringBuffer.GetRange(fromLSN, toLSN)
-	if err != nil {
-		return err // ErrRangeEvicted indicates full snapshot required
+// CatchUpReplica streams missing LSN mutations to a lagging replica.
+// If the mutations are present in the Hot RingBuffer, they are served directly from RAM.
+// If the requested range has been evicted from RAM, the Cold Storage archive is transparently
+// scanned on disk to fulfill the historical range without touching Primary disk I/O.
+func (c *Coordinator) CatchUpReplica(ctx context.Context, replicaAddr string, fromLSN, toLSN uint64, model ...string) error {
+	modelName := "default"
+	if len(model) > 0 && model[0] != "" {
+		modelName = model[0]
 	}
 
 	timeout := 2 * time.Second
-	for _, entry := range entries {
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		default:
-		}
 
-		streamFrame := wire.Frame{
-			Magic:   wire.Magic,
-			Version: wire.Version,
-			OpCode:  wire.OpReplicationStream,
-			Seq:     entry.Seq,
-			Payload: entry.Payload,
-		}
+	// 1. Attempt Hot tier retrieval from RingBuffer
+	entries, err := c.ringBuffer.GetRange(fromLSN, toLSN)
+	if err == nil {
+		for _, entry := range entries {
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			default:
+			}
 
-		resp, err := c.pool.ExecuteFrame(replicaAddr, streamFrame, timeout)
-		if err != nil || resp.OpCode == wire.OpResponseError {
-			return fmt.Errorf("replication catchup failed at LSN %d: %w", entry.LSN, err)
-		}
+			streamFrame := wire.Frame{
+				Magic:   wire.Magic,
+				Version: wire.Version,
+				OpCode:  wire.OpReplicationStream,
+				Seq:     entry.Seq,
+				Payload: entry.Payload,
+			}
 
-		c.lagTracker.RecordReplicaAck(replicaAddr, entry.LSN)
+			resp, repErr := c.pool.ExecuteFrame(replicaAddr, streamFrame, timeout)
+			if repErr != nil || resp.OpCode == wire.OpResponseError {
+				return fmt.Errorf("replication catchup failed at LSN %d: %w", entry.LSN, repErr)
+			}
+
+			c.lagTracker.RecordReplicaAck(replicaAddr, entry.LSN)
+		}
+		return nil
 	}
 
-	return nil
+	// 2. Fall back to Cold tier if evicted from RAM
+	if errors.Is(err, ErrRangeEvicted) && c.coldStore != nil {
+		oldestHotLSN, _, count := c.ringBuffer.Bounds()
+		var coldEndLSN uint64
+		if count > 0 && oldestHotLSN > fromLSN {
+			if toLSN < oldestHotLSN {
+				coldEndLSN = toLSN
+			} else {
+				coldEndLSN = oldestHotLSN - 1
+			}
+		} else {
+			coldEndLSN = toLSN
+		}
+
+		coldRecords, coldErr := c.coldStore.GetRange(modelName, fromLSN, coldEndLSN)
+		if coldErr != nil {
+			return fmt.Errorf("cold storage catchup failed: %w", coldErr)
+		}
+		if len(coldRecords) == 0 {
+			return ErrRangeEvicted
+		}
+
+		// Stream historical cold records
+		for _, rec := range coldRecords {
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			default:
+			}
+
+			streamFrame := wire.Frame{
+				Magic:   wire.Magic,
+				Version: wire.Version,
+				OpCode:  wire.OpReplicationStream,
+				Seq:     uint32(rec.LSN),
+				Payload: rec.Payload,
+			}
+
+			resp, repErr := c.pool.ExecuteFrame(replicaAddr, streamFrame, timeout)
+			if repErr != nil || resp.OpCode == wire.OpResponseError {
+				return fmt.Errorf("cold replication catchup failed at LSN %d: %w", rec.LSN, repErr)
+			}
+
+			c.lagTracker.RecordReplicaAck(replicaAddr, rec.LSN)
+		}
+
+		// Stream remaining hot entries if range extends into RAM
+		if toLSN >= oldestHotLSN && count > 0 {
+			hotEntries, hotErr := c.ringBuffer.GetRange(oldestHotLSN, toLSN)
+			if hotErr == nil {
+				for _, entry := range hotEntries {
+					select {
+					case <-ctx.Done():
+						return ctx.Err()
+					default:
+					}
+
+					streamFrame := wire.Frame{
+						Magic:   wire.Magic,
+						Version: wire.Version,
+						OpCode:  wire.OpReplicationStream,
+						Seq:     entry.Seq,
+						Payload: entry.Payload,
+					}
+
+					resp, repErr := c.pool.ExecuteFrame(replicaAddr, streamFrame, timeout)
+					if repErr != nil || resp.OpCode == wire.OpResponseError {
+						return fmt.Errorf("hot replication catchup failed at LSN %d: %w", entry.LSN, repErr)
+					}
+
+					c.lagTracker.RecordReplicaAck(replicaAddr, entry.LSN)
+				}
+			}
+		}
+
+		return nil
+	}
+
+	return err
 }

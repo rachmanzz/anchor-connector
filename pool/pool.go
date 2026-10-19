@@ -94,10 +94,11 @@ func (p *Pool) Put(conn *BackendConn) {
 		return
 	}
 	p.mu.RLock()
+	closed := p.closed
 	np, exists := p.nodePools[conn.addr]
 	p.mu.RUnlock()
 
-	if !exists || p.closed {
+	if !exists || closed {
 		_ = conn.Close()
 		return
 	}

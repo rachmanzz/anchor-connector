@@ -3,9 +3,11 @@ package replication
 import (
 	"context"
 	"net"
+	"os"
 	"testing"
 	"time"
 
+	"github.com/rachmanzz/anchor-connector/coldstorage"
 	"github.com/rachmanzz/anchor-connector/config"
 	"github.com/rachmanzz/anchor-connector/pool"
 	"github.com/rachmanzz/anchor-connector/wire"
@@ -214,3 +216,89 @@ func TestCoordinator_SemiSyncQuorum(t *testing.T) {
 		t.Fatalf("expected ring buffer latest 42 and count 1, got latest=%d count=%d", latest, count)
 	}
 }
+
+func TestCoordinator_TieredCatchUpWithColdStorage(t *testing.T) {
+	primaryLn, primaryAddr := setupMockNode(t)
+	defer primaryLn.Close()
+
+	repLn, repAddr := setupMockNode(t)
+	defer repLn.Close()
+
+	tempDir, err := os.MkdirTemp("", "coord_cold_test_*")
+	if err != nil {
+		t.Fatalf("failed to create temp dir: %v", err)
+	}
+	defer os.RemoveAll(tempDir)
+
+	coldMgr, err := coldstorage.NewManager(config.ColdStorageConfig{
+		Enabled:              true,
+		StorageDir:           tempDir,
+		MaxFileSizeMB:        10,
+		SyncStrategy:         "always",
+		FsyncIntervalSeconds: 1,
+	})
+	if err != nil {
+		t.Fatalf("failed to create cold manager: %v", err)
+	}
+	defer coldMgr.Close()
+
+	poolCfg := config.PoolConfig{
+		MinIdleConnections: 1,
+		MaxConnections:     4,
+		ConnectTimeoutMS:   500,
+		IdleTimeoutSeconds: 60,
+	}
+	p := pool.NewPool(poolCfg)
+	defer p.Close()
+
+	repCfg := config.ReplicationConfig{
+		DefaultMode:          "async",
+		QuorumSize:           1,
+		QuorumTimeoutMS:      500,
+		RingBufferCapacityMB: 1,
+		MaxToleratedLagMS:    2000,
+	}
+
+	coord := NewCoordinator(repCfg, p)
+	coord.SetColdStorage(coldMgr)
+
+	// Override ring buffer with capacity 3 to trigger eviction quickly
+	coord.ringBuffer = NewRingBuffer(3, 1024*1024)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	// Push 6 mutations (LSN 1 to 6)
+	for i := uint64(1); i <= 6; i++ {
+		frame := wire.Frame{
+			Magic:   wire.Magic,
+			Version: wire.Version,
+			OpCode:  wire.OpSave,
+			Seq:     uint32(i),
+			Payload: []byte("mutation_val"),
+		}
+		_, err := coord.BroadcastMutation(ctx, primaryAddr, []string{}, frame, i, "customers")
+		if err != nil {
+			t.Fatalf("BroadcastMutation failed at LSN %d: %v", i, err)
+		}
+	}
+
+	// Verify that ring buffer holds only the latest 3 items [4, 5, 6]
+	oldest, latest, count := coord.RingBuffer().Bounds()
+	if oldest != 4 || latest != 6 || count != 3 {
+		t.Fatalf("expected ring buffer bounds [4, 6] with count 3, got [%d, %d] count %d", oldest, latest, count)
+	}
+
+	// LSN 1 to 3 should be evicted from RAM, triggering cold storage catch-up
+	err = coord.CatchUpReplica(ctx, repAddr, 1, 6, "customers")
+	if err != nil {
+		t.Fatalf("Tiered CatchUpReplica failed: %v", err)
+	}
+
+	// Verify that replica received all frames up to LSN 6
+	repAck := coord.LagTracker().ReplicaAckLSN(repAddr)
+	if repAck != 6 {
+		t.Fatalf("expected replica AckLSN to be 6, got %d", repAck)
+	}
+}
+
