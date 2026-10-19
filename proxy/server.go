@@ -225,9 +225,10 @@ func (s *Server) acceptWireConnections() {
 	}
 }
 
-// clientSession maintains connection-bound state (authentication and selected model).
+// clientSession maintains connection-bound state (authentication, subject identity, and selected model).
 type clientSession struct {
 	authenticated bool
+	subject       string
 	selectedModel string
 }
 
@@ -242,8 +243,13 @@ func (s *Server) handleClient(clientConn net.Conn) {
 		s.wg.Done()
 	}()
 
+	initialSubject := "anonymous"
+	if !s.auth.IsEnabled() {
+		initialSubject = "admin"
+	}
 	sess := &clientSession{
 		authenticated: !s.auth.IsEnabled(),
+		subject:       initialSubject,
 		selectedModel: "default",
 	}
 
@@ -292,7 +298,21 @@ func (s *Server) handleClient(clientConn net.Conn) {
 		// Handle OpAuth
 		if frame.OpCode == wire.OpAuth {
 			token, err := wire.DecodeAuthPayload(frame.Payload)
-			if err != nil || s.auth.AuthenticateToken(token) != nil {
+			if err != nil {
+				errResp := wire.Frame{
+					Magic:   wire.Magic,
+					Version: wire.Version,
+					OpCode:  wire.OpResponseError,
+					Seq:     frame.Seq,
+					Payload: wire.EncodeErrorPayload(401, "unauthorized: malformed auth payload"),
+				}
+				_ = wire.WriteFrame(clientConn, errResp)
+				recordMetrics("unauthorized")
+				return
+			}
+
+			subject, authErr := s.auth.AuthenticateTokenWithSubject(token)
+			if authErr != nil {
 				errResp := wire.Frame{
 					Magic:   wire.Magic,
 					Version: wire.Version,
@@ -306,6 +326,7 @@ func (s *Server) handleClient(clientConn net.Conn) {
 			}
 
 			sess.authenticated = true
+			sess.subject = subject
 			okResp := wire.Frame{
 				Magic:   wire.Magic,
 				Version: wire.Version,
@@ -350,6 +371,23 @@ func (s *Server) handleClient(clientConn net.Conn) {
 			}
 			recordMetrics("ok")
 			continue
+		}
+
+		// Enforce RBAC permission if enforcer is active
+		if s.auth.Enforcer() != nil && s.auth.Enforcer().IsEnabled() {
+			allowed, enfErr := s.auth.Enforcer().EnforceOp(sess.subject, sess.selectedModel, frame.OpCode)
+			if enfErr != nil || !allowed {
+				errResp := wire.Frame{
+					Magic:   wire.Magic,
+					Version: wire.Version,
+					OpCode:  wire.OpResponseError,
+					Seq:     frame.Seq,
+					Payload: wire.EncodeErrorPayload(403, fmt.Sprintf("forbidden: subject '%s' lacks permission for op 0x%02X on model '%s'", sess.subject, frame.OpCode, sess.selectedModel)),
+				}
+				_ = wire.WriteFrame(clientConn, errResp)
+				recordMetrics("forbidden")
+				continue
+			}
 		}
 
 		// Check adaptive backpressure
@@ -467,6 +505,48 @@ func (s *Server) handleHTTPModelQuery(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	modelName = parts[0]
+
+	// Authenticate and enforce RBAC for HTTP query
+	subject := "anonymous"
+	if s.auth != nil && s.auth.IsEnabled() {
+		authHeader := r.Header.Get("Authorization")
+		var token string
+		if strings.HasPrefix(authHeader, "Bearer ") {
+			token = strings.TrimPrefix(authHeader, "Bearer ")
+		} else if tok := r.Header.Get("X-Auth-Token"); tok != "" {
+			token = tok
+		}
+
+		if token != "" {
+			sub, aErr := s.auth.AuthenticateTokenWithSubject(token)
+			if aErr != nil {
+				status = "unauthorized"
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusUnauthorized)
+				_ = json.NewEncoder(w).Encode(map[string]string{"error": "unauthorized"})
+				return
+			}
+			subject = sub
+		}
+	}
+
+	if s.auth != nil && s.auth.Enforcer() != nil && s.auth.Enforcer().IsEnabled() {
+		allowed, enfErr := s.auth.Enforcer().EnforceOp(subject, modelName, wire.OpList)
+		if enfErr != nil || !allowed {
+			status = "forbidden"
+			w.Header().Set("Content-Type", "application/json")
+			if subject == "anonymous" {
+				w.WriteHeader(http.StatusUnauthorized)
+				_ = json.NewEncoder(w).Encode(map[string]string{"error": "unauthorized: authentication required"})
+				return
+			}
+			w.WriteHeader(http.StatusForbidden)
+			_ = json.NewEncoder(w).Encode(map[string]string{
+				"error": fmt.Sprintf("forbidden: subject '%s' lacks read permission on model '%s'", subject, modelName),
+			})
+			return
+		}
+	}
 
 	// Forward simple OpList or OpGet to backend
 	targetNode, _, err := s.router.SelectTarget(modelName, wire.OpList, wire.FlagNone)

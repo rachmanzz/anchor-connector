@@ -113,8 +113,13 @@ func main() {
 		log.Fatalf("[anchor-connector] FATAL: Invalid IP filter config: %v", err)
 	}
 
-	// 5. Authenticator
+	// 5. Authenticator & RBAC Enforcer
 	auth := security.NewAuthenticator(cfg.Security.Auth.Mode, cfg.Security.Auth.ResolveToken())
+	rbacEnf, err := security.BuildEnforcer(cfg.Security.RBAC, cfg.Security.Auth.ResolveToken())
+	if err != nil {
+		log.Fatalf("[anchor-connector] FATAL: Failed to initialize RBAC enforcer: %v", err)
+	}
+	auth.SetEnforcer(rbacEnf)
 
 	// 6. Router & Connection Pool
 	r := router.NewRouter(cfg.Routing)
@@ -213,6 +218,7 @@ func main() {
 	fmt.Printf(" HTTP Gateway (REST)  : %s\n", srv.HTTPAddr())
 	fmt.Printf(" TLS Encryption       : %v\n", cfg.Security.TLS.Enabled)
 	fmt.Printf(" Authentication Mode  : %s\n", cfg.Security.Auth.Mode)
+	fmt.Printf(" RBAC Policy Enforced : %v (Roles: %d, Users: %d)\n", cfg.Security.RBAC.Enabled, len(cfg.Security.RBAC.Roles), len(cfg.Security.RBAC.Users))
 	fmt.Printf(" IP Whitelist Enforced: %v\n", ipFilter.IsEnabled())
 	fmt.Printf(" Sharded Models Count : %d\n", len(cfg.Routing.Models))
 	fmt.Printf(" Replication Mode     : %s (Quorum: %d)\n", cfg.Replication.DefaultMode, cfg.Replication.QuorumSize)
@@ -238,6 +244,9 @@ func main() {
 					if reconciler != nil && m.DiscoveryService != "" {
 						reconciler.RegisterModelService(m.Name, m.DiscoveryService)
 					}
+				}
+				if newEnf, bErr := security.BuildEnforcer(newCfg.Security.RBAC, newCfg.Security.Auth.ResolveToken()); bErr == nil {
+					auth.SetEnforcer(newEnf)
 				}
 				log.Printf("[anchor-connector] Configuration reloaded successfully (%d models updated).", len(newCfg.Routing.Models))
 			}

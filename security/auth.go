@@ -15,6 +15,7 @@ var (
 type Authenticator struct {
 	mode        string // "none", "token"
 	staticToken string
+	enforcer    *Enforcer
 	mu          sync.RWMutex
 }
 
@@ -26,25 +27,51 @@ func NewAuthenticator(mode, staticToken string) *Authenticator {
 	}
 }
 
+// SetEnforcer binds an RBAC enforcer to the authenticator.
+func (a *Authenticator) SetEnforcer(enf *Enforcer) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.enforcer = enf
+}
+
+// Enforcer returns the configured RBAC enforcer if any.
+func (a *Authenticator) Enforcer() *Enforcer {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	return a.enforcer
+}
+
 // AuthenticateToken verifies the given token against the configured secret using constant-time comparison.
 func (a *Authenticator) AuthenticateToken(token string) error {
+	_, err := a.AuthenticateTokenWithSubject(token)
+	return err
+}
+
+// AuthenticateTokenWithSubject verifies the token and returns the matched subject identity.
+func (a *Authenticator) AuthenticateTokenWithSubject(token string) (string, error) {
 	a.mu.RLock()
 	defer a.mu.RUnlock()
 
 	if a.mode == "none" || a.mode == "" {
-		return nil // Authentication disabled
+		return "anonymous", nil // Authentication disabled
 	}
 
-	if a.staticToken == "" {
-		return ErrUnauthorized
+	// 1. Check RBAC enforcer subjects if configured
+	if a.enforcer != nil && a.enforcer.IsEnabled() {
+		sub, err := a.enforcer.AuthenticateToken(token)
+		if err == nil {
+			return sub, nil
+		}
 	}
 
-	// Constant-time compare to prevent timing side-channel attacks
-	if subtle.ConstantTimeCompare([]byte(token), []byte(a.staticToken)) != 1 {
-		return ErrUnauthorized
+	// 2. Check static admin token
+	if a.staticToken != "" {
+		if subtle.ConstantTimeCompare([]byte(token), []byte(a.staticToken)) == 1 {
+			return "admin", nil
+		}
 	}
 
-	return nil
+	return "", ErrUnauthorized
 }
 
 // IsEnabled returns true if authentication is required.

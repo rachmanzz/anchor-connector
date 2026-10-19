@@ -43,17 +43,53 @@ type AuthConfig struct {
 	StaticToken string `yaml:"static_token"`
 }
 
+// RBACRuleConfig defines a resource and action grant.
+type RBACRuleConfig struct {
+	Resources []string `yaml:"resources"`
+	Actions   []string `yaml:"actions"`
+}
+
+// RBACRoleConfig defines a role with optional parent inheritance and rules.
+type RBACRoleConfig struct {
+	Name    string           `yaml:"name"`
+	Parents []string         `yaml:"parents"`
+	Rules   []RBACRuleConfig `yaml:"rules"`
+}
+
+// RBACUserConfig binds a subject identifier and token to one or more roles.
+type RBACUserConfig struct {
+	Subject string   `yaml:"subject"`
+	Token   string   `yaml:"token"`
+	Roles   []string `yaml:"roles"`
+}
+
+// ResolveToken returns the token, resolving env: prefix if present.
+func (u *RBACUserConfig) ResolveToken() string {
+	if strings.HasPrefix(u.Token, "env:") {
+		return os.Getenv(strings.TrimPrefix(u.Token, "env:"))
+	}
+	return u.Token
+}
+
+// RBACConfig controls role-based access control policies.
+type RBACConfig struct {
+	Enabled bool             `yaml:"enabled"`
+	Roles   []RBACRoleConfig `yaml:"roles"`
+	Users   []RBACUserConfig `yaml:"users"`
+}
+
 // BackendAuthConfig defines authentication rules when connector dials backend AnchorDB nodes.
 type BackendAuthConfig struct {
 	Token          string `yaml:"token"`            // Bearer token or OTK
 	SessionKeyPath string `yaml:"session_key_path"` // Path to cached session key file
 }
 
-// SecurityConfig bundles TLS, auth, and network firewalling.
+// SecurityConfig bundles TLS, auth, RBAC, and network firewalling.
 type SecurityConfig struct {
 	TLS         TLSConfig         `yaml:"tls"`
 	Auth        AuthConfig        `yaml:"auth"`         // Inbound client auth
 	BackendAuth BackendAuthConfig `yaml:"backend_auth"` // Outbound backend auth
+	RBAC        RBACConfig        `yaml:"rbac"`         // Role-Based Access Control
 	EnforceIP   string            `yaml:"enforce_egress_ip"`
 	AllowedIPs  []string          `yaml:"allowed_backend_ips"`
 }

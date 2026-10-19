@@ -687,3 +687,273 @@ func TestProxy_AdminDrainEndpoints(t *testing.T) {
 	}
 	resp.Body.Close()
 }
+
+func TestProxy_RBAC_Enforcement(t *testing.T) {
+	backendLn, backendAddr := setupMockBackend(t)
+	defer backendLn.Close()
+
+	cfg := &config.Config{
+		Gateway: config.GatewayConfig{
+			ListenWireAddr: "127.0.0.1:0",
+			ListenHTTPAddr: "127.0.0.1:0",
+			ReadTimeoutMS:  1000,
+			WriteTimeoutMS: 1000,
+		},
+		Security: config.SecurityConfig{
+			Auth: config.AuthConfig{
+				Mode: "token",
+			},
+			RBAC: config.RBACConfig{
+				Enabled: true,
+				Roles: []config.RBACRoleConfig{
+					{
+						Name: "orders_reader",
+						Rules: []config.RBACRuleConfig{
+							{Resources: []string{"orders"}, Actions: []string{"read"}},
+						},
+					},
+					{
+						Name:    "orders_writer",
+						Parents: []string{"orders_reader"},
+						Rules: []config.RBACRuleConfig{
+							{Resources: []string{"orders"}, Actions: []string{"write"}},
+						},
+					},
+				},
+				Users: []config.RBACUserConfig{
+					{
+						Subject: "reader_client",
+						Token:   "token-reader-123",
+						Roles:   []string{"orders_reader"},
+					},
+					{
+						Subject: "writer_client",
+						Token:   "token-writer-456",
+						Roles:   []string{"orders_writer"},
+					},
+				},
+			},
+		},
+		Routing: config.RoutingConfig{
+			DefaultCluster: "default",
+			Models: []config.ModelConfig{
+				{
+					Name:      "orders",
+					ClusterID: "default",
+					Primary:   backendAddr,
+				},
+				{
+					Name:      "billing",
+					ClusterID: "default",
+					Primary:   backendAddr,
+				},
+			},
+		},
+		Pool: config.PoolConfig{
+			MaxConnections:   5,
+			ConnectTimeoutMS: 500,
+		},
+	}
+
+	r := router.NewRouter(cfg.Routing)
+	p := pool.NewPool(cfg.Pool)
+	auth := security.NewAuthenticator("token", "")
+	rbacEnf, err := security.BuildEnforcer(cfg.Security.RBAC, "")
+	if err != nil {
+		t.Fatalf("failed to build enforcer: %v", err)
+	}
+	auth.SetEnforcer(rbacEnf)
+
+	srv := NewServer(cfg, r, p, auth, nil, nil)
+	if err := srv.Start(); err != nil {
+		t.Fatalf("failed to start proxy server: %v", err)
+	}
+	defer func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		_ = srv.Shutdown(ctx)
+	}()
+
+	// --- 1. Test Wire TCP Client with reader token ---
+	conn, err := net.DialTimeout("tcp", srv.WireAddr(), time.Second)
+	if err != nil {
+		t.Fatalf("failed to dial wire server: %v", err)
+	}
+	defer conn.Close()
+
+	// Authenticate as reader_client
+	authFrame := wire.Frame{
+		Magic:   wire.Magic,
+		Version: wire.Version,
+		OpCode:  wire.OpAuth,
+		Seq:     1,
+		Payload: wire.EncodeAuthPayload("token-reader-123"),
+	}
+	if err := wire.WriteFrame(conn, authFrame); err != nil {
+		t.Fatalf("write auth failed: %v", err)
+	}
+	authResp, err := wire.ReadFrame(conn)
+	if err != nil || authResp.OpCode != wire.OpResponseOK {
+		t.Fatalf("auth as reader failed: %+v", authResp)
+	}
+
+	// Select model "orders"
+	selectOrders := wire.Frame{
+		Magic:   wire.Magic,
+		Version: wire.Version,
+		OpCode:  wire.OpSelectModel,
+		Seq:     2,
+		Payload: []byte("orders"),
+	}
+	if err := wire.WriteFrame(conn, selectOrders); err != nil {
+		t.Fatalf("select orders failed: %v", err)
+	}
+	selectResp, err := wire.ReadFrame(conn)
+	if err != nil || selectResp.OpCode != wire.OpResponseOK {
+		t.Fatalf("select orders response error: %+v", selectResp)
+	}
+
+	// Send OpGet -> Allowed
+	getFrame := wire.Frame{
+		Magic:   wire.Magic,
+		Version: wire.Version,
+		OpCode:  wire.OpGet,
+		Seq:     3,
+		Payload: []byte("order:1"),
+	}
+	if err := wire.WriteFrame(conn, getFrame); err != nil {
+		t.Fatalf("write get failed: %v", err)
+	}
+	getResp, err := wire.ReadFrame(conn)
+	if err != nil || getResp.OpCode != wire.OpResponseOK {
+		t.Fatalf("expected OpResponseOK for reader on OpGet, got: %+v", getResp)
+	}
+
+	// Send OpSave -> Denied with 403 Forbidden!
+	saveFrame := wire.Frame{
+		Magic:   wire.Magic,
+		Version: wire.Version,
+		OpCode:  wire.OpSave,
+		Seq:     4,
+		Payload: []byte(`{"id": 1}`),
+	}
+	if err := wire.WriteFrame(conn, saveFrame); err != nil {
+		t.Fatalf("write save failed: %v", err)
+	}
+	saveResp, err := wire.ReadFrame(conn)
+	if err != nil || saveResp.OpCode != wire.OpResponseError {
+		t.Fatalf("expected OpResponseError for reader on OpSave, got: %+v", saveResp)
+	}
+	code, msg, _ := wire.DecodeErrorPayload(saveResp.Payload)
+	if code != 403 {
+		t.Fatalf("expected error code 403, got %d (msg: %s)", code, msg)
+	}
+
+	// Select model "billing" -> reader has no permissions on billing
+	selectBilling := wire.Frame{
+		Magic:   wire.Magic,
+		Version: wire.Version,
+		OpCode:  wire.OpSelectModel,
+		Seq:     5,
+		Payload: []byte("billing"),
+	}
+	if err := wire.WriteFrame(conn, selectBilling); err != nil {
+		t.Fatalf("select billing failed: %v", err)
+	}
+	_, _ = wire.ReadFrame(conn)
+
+	// Send OpGet on billing -> Denied with 403!
+	getBilling := wire.Frame{
+		Magic:   wire.Magic,
+		Version: wire.Version,
+		OpCode:  wire.OpGet,
+		Seq:     6,
+	}
+	if err := wire.WriteFrame(conn, getBilling); err != nil {
+		t.Fatalf("write get billing failed: %v", err)
+	}
+	billingResp, err := wire.ReadFrame(conn)
+	if err != nil || billingResp.OpCode != wire.OpResponseError {
+		t.Fatalf("expected OpResponseError on unauthorized model billing, got: %+v", billingResp)
+	}
+	bCode, _, _ := wire.DecodeErrorPayload(billingResp.Payload)
+	if bCode != 403 {
+		t.Fatalf("expected 403 for unauthorized model, got %d", bCode)
+	}
+
+	// --- 2. Test Wire TCP Client with writer token (inherits reader) ---
+	wConn, err := net.DialTimeout("tcp", srv.WireAddr(), time.Second)
+	if err != nil {
+		t.Fatalf("failed to dial wire server for writer: %v", err)
+	}
+	defer wConn.Close()
+
+	// Authenticate as writer_client
+	wAuthFrame := wire.Frame{
+		Magic:   wire.Magic,
+		Version: wire.Version,
+		OpCode:  wire.OpAuth,
+		Seq:     1,
+		Payload: wire.EncodeAuthPayload("token-writer-456"),
+	}
+	_ = wire.WriteFrame(wConn, wAuthFrame)
+	_, _ = wire.ReadFrame(wConn)
+
+	// Select model "orders"
+	_ = wire.WriteFrame(wConn, selectOrders)
+	_, _ = wire.ReadFrame(wConn)
+
+	// Writer can write: OpSave -> Allowed
+	_ = wire.WriteFrame(wConn, saveFrame)
+	wSaveResp, err := wire.ReadFrame(wConn)
+	if err != nil || wSaveResp.OpCode != wire.OpResponseOK {
+		t.Fatalf("expected OpResponseOK for writer on OpSave, got: %+v", wSaveResp)
+	}
+
+	// Writer can read (inherited from orders_reader): OpGet -> Allowed
+	_ = wire.WriteFrame(wConn, getFrame)
+	wGetResp, err := wire.ReadFrame(wConn)
+	if err != nil || wGetResp.OpCode != wire.OpResponseOK {
+		t.Fatalf("expected OpResponseOK for writer inheriting read on OpGet, got: %+v", wGetResp)
+	}
+
+	// --- 3. Test HTTP Model Query with Bearer token ---
+	client := &http.Client{Timeout: 2 * time.Second}
+	baseURL := "http://" + srv.HTTPAddr()
+
+	// HTTP query with valid token for "orders" -> 200 OK
+	req, _ := http.NewRequest(http.MethodGet, baseURL+"/api/v1/models/orders", nil)
+	req.Header.Set("Authorization", "Bearer token-reader-123")
+	httpResp, err := client.Do(req)
+	if err != nil {
+		t.Fatalf("HTTP request failed: %v", err)
+	}
+	if httpResp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 OK for valid reader token, got %d", httpResp.StatusCode)
+	}
+	httpResp.Body.Close()
+
+	// HTTP query with valid token for "billing" -> 403 Forbidden
+	req, _ = http.NewRequest(http.MethodGet, baseURL+"/api/v1/models/billing", nil)
+	req.Header.Set("Authorization", "Bearer token-reader-123")
+	httpResp, err = client.Do(req)
+	if err != nil {
+		t.Fatalf("HTTP request failed: %v", err)
+	}
+	if httpResp.StatusCode != http.StatusForbidden {
+		t.Fatalf("expected 403 Forbidden for unauthorized model, got %d", httpResp.StatusCode)
+	}
+	httpResp.Body.Close()
+
+	// HTTP query with invalid token -> 401 Unauthorized
+	req, _ = http.NewRequest(http.MethodGet, baseURL+"/api/v1/models/orders", nil)
+	req.Header.Set("Authorization", "Bearer invalid-token")
+	httpResp, err = client.Do(req)
+	if err != nil {
+		t.Fatalf("HTTP request failed: %v", err)
+	}
+	if httpResp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("expected 401 Unauthorized for invalid token, got %d", httpResp.StatusCode)
+	}
+	httpResp.Body.Close()
+}

@@ -17,6 +17,22 @@ security:
   auth:
     mode: "none" # "none", "token"
     static_token: "" # or "env:CONNECTOR_AUTH_TOKEN"
+  rbac:
+    enabled: false
+    roles:
+      - name: "model_reader"
+        rules:
+          - resources: ["*"]
+            actions: ["read"]
+      - name: "model_writer"
+        parents: ["model_reader"]
+        rules:
+          - resources: ["*"]
+            actions: ["write"]
+    users:
+      - subject: "app_service"
+        token: "env:CONNECTOR_APP_TOKEN"
+        roles: ["model_writer"]
   allowed_backend_ips:
     - "127.0.0.1/32"
     - "10.0.0.0/8"
