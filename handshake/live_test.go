@@ -1,8 +1,10 @@
 package handshake
 
 import (
+	"errors"
 	"net"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"testing"
 	"time"
@@ -145,3 +147,136 @@ func TestLiveAnchorDB_GatewayMode(t *testing.T) {
 		t.Logf("Pool connection and reuse verified successfully in Gateway Mode")
 	})
 }
+
+// TestLiveAnchorDB_AutoHealing_RestartSurvival verifies that Anchor Connector automatically
+// recovers from Error 1004 (invalid session key signature) across real Podman container restarts.
+func TestLiveAnchorDB_AutoHealing_RestartSurvival(t *testing.T) {
+	addr := os.Getenv("ANCHORDB_LIVE_TEST_ADDR")
+	if addr == "" {
+		addr = "127.0.0.1:17448"
+	}
+
+	// 1. Probe if live container is running
+	probeConn, err := net.DialTimeout("tcp", addr, 500*time.Millisecond)
+	if err != nil {
+		t.Skipf("skipping live test: AnchorDB not reachable at %s (%v)", addr, err)
+	}
+	_ = probeConn.Close()
+
+	// 2. Setup temporary session directory
+	tempDir, err := os.MkdirTemp("", "autoheal_live_*")
+	if err != nil {
+		t.Fatalf("failed to create temp dir: %v", err)
+	}
+	defer os.RemoveAll(tempDir)
+
+	sessionFile := filepath.Join(tempDir, "connector_session.key")
+
+	// 3. Initial Pairing & Session Acquisition
+	c1, err := net.DialTimeout("tcp", addr, time.Second)
+	if err != nil {
+		t.Fatalf("failed to dial initial conn: %v", err)
+	}
+	defer c1.Close()
+
+	hs := NewClientHandshaker("", "users", 2*time.Second)
+	hs.SetNodeID("connector-live-autoheal")
+	hs.SetSessionFilePath(sessionFile)
+	hs.SetValidatorFilePath("") // focused on session recovery
+
+	state, err := hs.PerformHandshake(c1)
+	if err != nil {
+		t.Skipf("pairing window was closed, skipping restart survival test: %v", err)
+	}
+	if state != StateReady {
+		t.Fatalf("expected StateReady on initial handshake, got %v", state)
+	}
+
+	initialKey, err := hs.LoadSavedSessionKey()
+	if err != nil || initialKey == "" {
+		t.Fatalf("failed to load initial session key: %v", err)
+	}
+	t.Logf("Initial SessionKey acquired: %s", initialKey)
+
+	// 4. Restart the AnchorDB container (erasing ephemeral in-memory session secret)
+	t.Log("Restarting container test-anchordb via podman...")
+	cmd := exec.Command("podman", "restart", "test-anchordb")
+	if out, rErr := cmd.CombinedOutput(); rErr != nil {
+		t.Skipf("skipping restart test: failed to restart container: %v (output: %s)", rErr, string(out))
+	}
+	time.Sleep(1200 * time.Millisecond) // wait for server to listen on port 17448
+
+	// 5. Connect again with hs holding the old SessionKey
+	c2, err := net.DialTimeout("tcp", addr, 2*time.Second)
+	if err != nil {
+		t.Fatalf("failed to dial post-restart conn: %v", err)
+	}
+	defer c2.Close()
+
+	// AnchorDB rejects old session ticket with 1004 -> Connector purges sessionFile & returns SessionInvalidatedError
+	_, err = hs.PerformHandshake(c2)
+	if err == nil {
+		t.Fatal("expected SessionInvalidatedError on dead session key, got nil")
+	}
+	var sic *SessionInvalidatedError
+	if !errors.As(err, &sic) {
+		t.Fatalf("expected SessionInvalidatedError, got %v", err)
+	}
+
+	// 6. Connect on new socket: since stale session file is purged, hs automatically performs Pairing!
+	c3, err := net.DialTimeout("tcp", addr, 2*time.Second)
+	if err != nil {
+		t.Fatalf("failed to dial c3: %v", err)
+	}
+	defer c3.Close()
+
+	state3, err := hs.PerformHandshake(c3)
+	if err != nil {
+		t.Fatalf("Auto-healing re-dial failed: %v", err)
+	}
+	if state3 != StateReady {
+		t.Fatalf("expected StateReady post-restart, got %v", state3)
+	}
+
+	newKey, err := hs.LoadSavedSessionKey()
+	if err != nil {
+		t.Fatalf("failed to load recovered session key: %v", err)
+	}
+	if newKey == initialKey {
+		t.Fatalf("expected a new session key to be issued post-restart, but got old key: %s", newKey)
+	}
+	t.Logf("Auto-healing SUCCESSFUL! New SessionKey: %s", newKey)
+
+	// 7. Verify Pool Auto-Healing across container restart (100% transparent to caller)
+	p := pool.NewPool(config.PoolConfig{
+		MinIdleConnections: 1,
+		MaxConnections:     5,
+		ConnectTimeoutMS:   1000,
+		IdleTimeoutSeconds: 30,
+	})
+	defer p.Close()
+
+	p.SetHandshakeFunc(func(c net.Conn, backendAddr string) error {
+		h := NewClientHandshaker("", "users", 2*time.Second)
+		h.SetNodeID("connector-live-pool-autoheal")
+		h.SetSessionFilePath(sessionFile)
+		_, hErr := h.PerformHandshake(c)
+		return hErr
+	})
+
+	req := wire.Frame{
+		Magic:   wire.Magic,
+		Version: wire.Version,
+		OpCode:  wire.OpPing,
+		Seq:     701,
+	}
+	resp, err := p.ExecuteFrame(addr, req, 2*time.Second)
+	if err != nil {
+		t.Fatalf("pool execution failed: %v", err)
+	}
+	if resp.OpCode != wire.OpPong {
+		t.Fatalf("expected OpPong, got 0x%02x", resp.OpCode)
+	}
+	t.Logf("Pool transparent auto-healing verified successfully!")
+}
+

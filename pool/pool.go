@@ -222,10 +222,34 @@ func (np *SingleNodePool) acquire() (*BackendConn, error) {
 	if np.handshakeFn != nil {
 		if err := np.handshakeFn(rawConn, np.addr); err != nil {
 			_ = rawConn.Close()
+
+			// Auto-healing: If session key was invalidated (code 1004), stale credentials were wiped.
+			// Retry once on a fresh socket to acquire a new valid session via pairing or dynamic token.
+			type sessionInvalidatedChecker interface {
+				SessionInvalidated() bool
+			}
+			var sic sessionInvalidatedChecker
+			if errors.As(err, &sic) && sic.SessionInvalidated() {
+				rawConn2, dialErr := net.DialTimeout("tcp", np.addr, np.connectTimeout)
+				if dialErr == nil {
+					if tcpConn, ok := rawConn2.(*net.TCPConn); ok {
+						_ = tcpConn.SetNoDelay(true)
+						_ = tcpConn.SetKeepAlive(true)
+						_ = tcpConn.SetKeepAlivePeriod(15 * time.Second)
+					}
+					if hErr2 := np.handshakeFn(rawConn2, np.addr); hErr2 == nil {
+						rawConn = rawConn2
+						goto ConnReady
+					}
+					_ = rawConn2.Close()
+				}
+			}
+
 			return nil, fmt.Errorf("pool: backend handshake failed for %s: %w", np.addr, err)
 		}
 	}
 
+ConnReady:
 	bConn := &BackendConn{
 		Conn:      rawConn,
 		addr:      np.addr,

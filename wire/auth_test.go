@@ -101,3 +101,54 @@ func TestAuthResponse_EncodeDecode(t *testing.T) {
 		t.Fatal("expected error on invalid response marker, got nil")
 	}
 }
+
+func TestStagedReauth_EncodeDecode(t *testing.T) {
+	val := []byte("secret-preimage-validator-32byte")
+	commit := []byte("sha256-hash-next-commitment-32by")
+
+	req := AuthRequest{
+		Type:           AuthTypeStagedReauth,
+		NodeID:         "connector-node-test-01",
+		Validator:      val,
+		NextCommitment: commit,
+	}
+
+	encoded := EncodeStructuredAuth(req)
+	decoded, err := DecodeStructuredAuth(encoded)
+	if err != nil {
+		t.Fatalf("DecodeStructuredAuth failed for StagedReauth: %v", err)
+	}
+
+	if decoded.Type != AuthTypeStagedReauth {
+		t.Errorf("Type mismatch: got %d, want %d", decoded.Type, AuthTypeStagedReauth)
+	}
+	if decoded.NodeID != req.NodeID {
+		t.Errorf("NodeID mismatch: got %s, want %s", decoded.NodeID, req.NodeID)
+	}
+	if !bytes.Equal(decoded.Validator, val) {
+		t.Errorf("Validator mismatch: got %v, want %v", decoded.Validator, val)
+	}
+	if !bytes.Equal(decoded.NextCommitment, commit) {
+		t.Errorf("NextCommitment mismatch: got %v, want %v", decoded.NextCommitment, commit)
+	}
+
+	// Test response encode/decode
+	respMsg := "Commitment staged successfully"
+	respBytes := EncodeStagedReauthResponse(StagedReauthSubCodeOK, respMsg)
+	subCode, msg, err := DecodeStagedReauthResponse(respBytes)
+	if err != nil {
+		t.Fatalf("DecodeStagedReauthResponse failed: %v", err)
+	}
+	if subCode != StagedReauthSubCodeOK {
+		t.Errorf("subCode mismatch: got %d, want %d", subCode, StagedReauthSubCodeOK)
+	}
+	if msg != respMsg {
+		t.Errorf("msg mismatch: got %q, want %q", msg, respMsg)
+	}
+
+	// Malformed response
+	if _, _, err := DecodeStagedReauthResponse([]byte{StructuredRespMagic, 0x01}); err == nil {
+		t.Errorf("expected error on truncated staged reauth response")
+	}
+}
+
