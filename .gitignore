@@ -1,0 +1,26 @@
+# Binaries
+bin/
+anchor-connector
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Storage & Cold files
+data/
+*.acold
+*.anchordb
+
+# Test artifacts
+*.test
+*.out
+
+# Environment & OS
+.env
+.DS_Store
+Thumbs.db
+
+# Local knowledge base (all contents ignored without exception)
+.knowledges/
+.knowledges/**

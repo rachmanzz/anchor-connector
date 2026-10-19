@@ -1,0 +1,52 @@
+# Anchor Connector Configuration File (Production Example)
+gateway:
+  listen_wire_addr: "0.0.0.0:7448"
+  listen_http_addr: "0.0.0.0:7447"
+  read_timeout_ms: 5000
+  write_timeout_ms: 5000
+  idle_timeout_ms: 60000
+  max_connections: 50000
+
+security:
+  tls:
+    enabled: false
+    mode: "disabled" # "letsencrypt", "file", "cloudflare", "disabled"
+    min_version: "TLS13"
+    cert_file: ""
+    key_file: ""
+  auth:
+    mode: "none" # "none", "token"
+    static_token: "" # or "env:CONNECTOR_AUTH_TOKEN"
+  allowed_backend_ips:
+    - "127.0.0.1/32"
+    - "10.0.0.0/8"
+
+pool:
+  min_idle_connections: 8
+  max_connections: 64
+  connect_timeout_ms: 1000
+  idle_timeout_seconds: 60
+
+routing:
+  default_cluster: "default"
+  model_resolution_mode: "strict" # "strict" or "dynamic"
+  models:
+    - name: "default"
+      cluster_id: "cluster-primary"
+      primary: "127.0.0.1:7448"
+      replicas: []
+      max_qps: 10000
+
+replication:
+  default_mode: "semi_sync" # "semi_sync" or "async"
+  quorum_size: 1
+  quorum_timeout_ms: 500
+  ring_buffer_capacity_mb: 64
+  max_tolerated_lag_ms: 2000
+
+cold_storage:
+  enabled: true
+  storage_dir: "./data/cold"
+  max_file_size_mb: 512
+  sync_strategy: "interval" # "interval" or "always"
+  fsync_interval_seconds: 5
