@@ -12,19 +12,19 @@ import (
 )
 
 var (
-	ErrPoolClosed   = errors.New("pool: connection pool is closed")
-	ErrConnTimeout  = errors.New("pool: connection timeout")
-	ErrNodeDead     = errors.New("pool: backend node unreachable")
+	ErrPoolClosed  = errors.New("pool: connection pool is closed")
+	ErrConnTimeout = errors.New("pool: connection timeout")
+	ErrNodeDead    = errors.New("pool: backend node unreachable")
 )
 
 // BackendConn wraps a persistent net.Conn with health and timeout tracking.
 type BackendConn struct {
 	net.Conn
-	addr       string
-	createdAt  time.Time
-	lastUsed   time.Time
-	healthy    bool
-	inUse      bool
+	addr      string
+	createdAt time.Time
+	lastUsed  time.Time
+	healthy   bool
+	inUse     bool
 }
 
 // HandshakeFunc executes connection initialization (e.g. auth and model selection)

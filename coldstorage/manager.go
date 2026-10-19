@@ -261,7 +261,7 @@ func (m *Manager) GetRange(model string, fromLSN, toLSN uint64) ([]Record, error
 		}
 
 		// Overlap check: segment range [hdr.BaseLSN, hdr.EndLSN] overlaps [fromLSN, toLSN]
-		if !(hdr.EndLSN < fromLSN || hdr.BaseLSN > toLSN) {
+		if hdr.EndLSN >= fromLSN && hdr.BaseLSN <= toLSN {
 			matchingSegments = append(matchingSegments, segmentMeta{
 				filePath: fullPath,
 				baseLSN:  hdr.BaseLSN,

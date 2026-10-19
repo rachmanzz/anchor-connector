@@ -25,15 +25,15 @@ type MutationEntry struct {
 
 // RingBuffer is a thread-safe circular in-memory buffer for absorbing replication deltas.
 type RingBuffer struct {
-	entries       []MutationEntry
-	capacity      int
-	maxSizeBytes  int64
-	currentBytes  int64
-	head          int // index of next insert
-	count         int
-	oldestLSN     uint64
-	latestLSN     uint64
-	mu            sync.RWMutex
+	entries      []MutationEntry
+	capacity     int
+	maxSizeBytes int64
+	currentBytes int64
+	head         int // index of next insert
+	count        int
+	oldestLSN    uint64
+	latestLSN    uint64
+	mu           sync.RWMutex
 }
 
 // NewRingBuffer allocates a ring buffer with maximum entry capacity and byte limit.
@@ -73,12 +73,18 @@ func (rb *RingBuffer) Push(lsn uint64, frame wire.Frame) {
 		rb.count--
 	}
 
+	var payloadCopy []byte
+	if len(frame.Payload) > 0 {
+		payloadCopy = make([]byte, len(frame.Payload))
+		copy(payloadCopy, frame.Payload)
+	}
+
 	entry := MutationEntry{
 		LSN:       lsn,
 		OpCode:    frame.OpCode,
 		Flags:     frame.Flags,
 		Seq:       frame.Seq,
-		Payload:   frame.Payload,
+		Payload:   payloadCopy,
 		CreatedAt: time.Now(),
 	}
 

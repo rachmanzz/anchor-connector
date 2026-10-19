@@ -52,7 +52,7 @@ type BackendAuthConfig struct {
 // SecurityConfig bundles TLS, auth, and network firewalling.
 type SecurityConfig struct {
 	TLS         TLSConfig         `yaml:"tls"`
-	Auth        AuthConfig        `yaml:"auth"` // Inbound client auth
+	Auth        AuthConfig        `yaml:"auth"`         // Inbound client auth
 	BackendAuth BackendAuthConfig `yaml:"backend_auth"` // Outbound backend auth
 	EnforceIP   string            `yaml:"enforce_egress_ip"`
 	AllowedIPs  []string          `yaml:"allowed_backend_ips"`

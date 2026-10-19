@@ -21,16 +21,16 @@ func (s State) String() string {
 
 // CircuitBreaker guards a backend node against cascading overload and detects failures.
 type CircuitBreaker struct {
-	nodeAddr               string
-	state                  State
-	consecutiveFailures    int
-	consecutiveSuccesses   int
-	failureThreshold       int
-	successThreshold       int
-	cooldownDuration       time.Duration
-	lastStateChange        time.Time
-	lastFailureTime        time.Time
-	mu                     sync.RWMutex
+	nodeAddr             string
+	state                State
+	consecutiveFailures  int
+	consecutiveSuccesses int
+	failureThreshold     int
+	successThreshold     int
+	cooldownDuration     time.Duration
+	lastStateChange      time.Time
+	lastFailureTime      time.Time
+	mu                   sync.RWMutex
 }
 
 // NewCircuitBreaker builds a circuit breaker with specified thresholds and cooldown period.

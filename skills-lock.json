@@ -1,0 +1,17 @@
+{
+  "version": 1,
+  "skills": {
+    "go-code-review": {
+      "source": "cxuu/golang-skills",
+      "sourceType": "github",
+      "skillPath": "skills/go-code-review/SKILL.md",
+      "computedHash": "48b7d7ad2fcfeb1415d2743bd7eb4a33c6314bef43dd0bef98c4194b23bd700a"
+    },
+    "golang-concurrency": {
+      "source": "samber/cc-skills-golang",
+      "sourceType": "github",
+      "skillPath": "skills/golang-concurrency/SKILL.md",
+      "computedHash": "f76a7af92805c94c91b7aea0f743e20c4613ca346203cbd7f0e9d296a7970385"
+    }
+  }
+}

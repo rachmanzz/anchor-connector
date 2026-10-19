@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/rachmanzz/anchor-connector/coldstorage"
@@ -25,6 +26,12 @@ type Coordinator struct {
 	ringBuffer *RingBuffer
 	lagTracker *LagTracker
 	coldStore  *coldstorage.Manager
+
+	wg       sync.WaitGroup
+	closed   atomic.Bool
+	ctx      context.Context
+	cancel   context.CancelFunc
+	asyncSem chan struct{}
 }
 
 // NewCoordinator creates a configured replication coordinator.
@@ -39,11 +46,20 @@ func NewCoordinator(cfg config.ReplicationConfig, p *pool.Pool) *Coordinator {
 		1000,
 	)
 
+	ctx, cancel := context.WithCancel(context.Background())
+	maxAsyncWorkers := cfg.QuorumSize * 16
+	if maxAsyncWorkers < 256 {
+		maxAsyncWorkers = 256
+	}
+
 	return &Coordinator{
 		cfg:        cfg,
 		pool:       p,
 		ringBuffer: ringBuf,
 		lagTracker: lagTracker,
+		ctx:        ctx,
+		cancel:     cancel,
+		asyncSem:   make(chan struct{}, maxAsyncWorkers),
 	}
 }
 
@@ -139,12 +155,14 @@ func (c *Coordinator) BroadcastMutation(
 		}
 
 		ackChan := make(chan string, len(replicas))
-		var wg sync.WaitGroup
 
 		for _, replica := range replicas {
-			wg.Add(1)
+			c.wg.Add(1)
 			go func(repAddr string) {
-				defer wg.Done()
+				defer c.wg.Done()
+				if c.closed.Load() {
+					return
+				}
 				resp, repErr := c.pool.ExecuteFrame(repAddr, frame, timeout)
 				if repErr == nil && resp.OpCode != wire.OpResponseError {
 					c.lagTracker.RecordReplicaAck(repAddr, lsn)
@@ -188,17 +206,41 @@ func (c *Coordinator) BroadcastMutation(
 	}
 }
 
-// replicateAsync streams the mutation to all replicas concurrently in the background.
+// replicateAsync streams the mutation to all replicas concurrently in the background with bounded concurrency.
 func (c *Coordinator) replicateAsync(replicas []string, frame wire.Frame, lsn uint64, timeout time.Duration) {
+	if c.closed.Load() {
+		return
+	}
 	for _, replica := range replicas {
-		go func(repAddr string) {
-			resp, err := c.pool.ExecuteFrame(repAddr, frame, timeout)
-			if err == nil && resp.OpCode != wire.OpResponseError {
-				c.lagTracker.RecordReplicaAck(repAddr, lsn)
-			} else {
-				log.Printf("[anchor-connector] async replication failed for %s: %v", repAddr, err)
-			}
-		}(replica)
+		select {
+		case c.asyncSem <- struct{}{}:
+			c.wg.Add(1)
+			go func(repAddr string) {
+				defer func() {
+					<-c.asyncSem
+					c.wg.Done()
+				}()
+				if c.closed.Load() {
+					return
+				}
+				resp, err := c.pool.ExecuteFrame(repAddr, frame, timeout)
+				if err == nil && resp.OpCode != wire.OpResponseError {
+					c.lagTracker.RecordReplicaAck(repAddr, lsn)
+				} else {
+					log.Printf("[anchor-connector] async replication failed for %s: %v", repAddr, err)
+				}
+			}(replica)
+		default:
+			log.Printf("[anchor-connector] async replication queue full for %s, skipping frame LSN %d", replica, lsn)
+		}
+	}
+}
+
+// Close gracefully terminates background replication workers and waits for in-flight tasks.
+func (c *Coordinator) Close() {
+	if c.closed.CompareAndSwap(false, true) {
+		c.cancel()
+		c.wg.Wait()
 	}
 }
 

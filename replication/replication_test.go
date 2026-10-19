@@ -301,4 +301,3 @@ func TestCoordinator_TieredCatchUpWithColdStorage(t *testing.T) {
 		t.Fatalf("expected replica AckLSN to be 6, got %d", repAck)
 	}
 }
-

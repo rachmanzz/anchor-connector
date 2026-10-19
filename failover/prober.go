@@ -11,22 +11,23 @@ import (
 
 // NodeHealthStatus summarizes the health evaluation of a probed node.
 type NodeHealthStatus struct {
-	Addr        string
-	State       State
-	Healthy     bool
-	LatencyMS   int64
-	LastProbe   time.Time
+	Addr      string
+	State     State
+	Healthy   bool
+	LatencyMS int64
+	LastProbe time.Time
 }
 
 // Prober runs background health checks against backend AnchorDB nodes using AnchorWire OpPing.
 type Prober struct {
-	pool          *pool.Pool
-	breakers      map[string]*CircuitBreaker
-	interval      time.Duration
-	probeTimeout  time.Duration
-	stopChan      chan struct{}
-	mu            sync.RWMutex
-	wg            sync.WaitGroup
+	pool         *pool.Pool
+	breakers     map[string]*CircuitBreaker
+	interval     time.Duration
+	probeTimeout time.Duration
+	stopChan     chan struct{}
+	stopOnce     sync.Once
+	mu           sync.RWMutex
+	wg           sync.WaitGroup
 }
 
 // NewProber creates a Prober with the given check interval and probe timeout.
@@ -71,6 +72,16 @@ func (p *Prober) GetCircuitBreaker(nodeAddr string) *CircuitBreaker {
 func (p *Prober) ProbeNode(ctx context.Context, nodeAddr string) NodeHealthStatus {
 	cb := p.RegisterNode(nodeAddr)
 
+	if err := ctx.Err(); err != nil {
+		return NodeHealthStatus{
+			Addr:      nodeAddr,
+			State:     cb.State(),
+			Healthy:   false,
+			LatencyMS: 0,
+			LastProbe: time.Now(),
+		}
+	}
+
 	start := time.Now()
 	pingFrame := wire.Frame{
 		Magic:   wire.Magic,
@@ -80,7 +91,24 @@ func (p *Prober) ProbeNode(ctx context.Context, nodeAddr string) NodeHealthStatu
 		Payload: []byte("PROBE"),
 	}
 
-	resp, err := p.pool.ExecuteFrame(nodeAddr, pingFrame, p.probeTimeout)
+	timeout := p.probeTimeout
+	if deadline, ok := ctx.Deadline(); ok {
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			return NodeHealthStatus{
+				Addr:      nodeAddr,
+				State:     cb.State(),
+				Healthy:   false,
+				LatencyMS: 0,
+				LastProbe: time.Now(),
+			}
+		}
+		if remaining < timeout {
+			timeout = remaining
+		}
+	}
+
+	resp, err := p.pool.ExecuteFrame(nodeAddr, pingFrame, timeout)
 	latency := time.Since(start).Milliseconds()
 
 	if err != nil || resp.OpCode != wire.OpPong {
@@ -131,16 +159,23 @@ func (p *Prober) probeAll() {
 	}
 	p.mu.RUnlock()
 
-	ctx, cancel := context.WithTimeout(context.Background(), p.probeTimeout)
-	defer cancel()
-
+	var wg sync.WaitGroup
 	for _, node := range nodes {
-		_ = p.ProbeNode(ctx, node)
+		wg.Add(1)
+		go func(addr string) {
+			defer wg.Done()
+			ctx, cancel := context.WithTimeout(context.Background(), p.probeTimeout)
+			defer cancel()
+			_ = p.ProbeNode(ctx, addr)
+		}(node)
 	}
+	wg.Wait()
 }
 
-// Stop terminates background health checks.
+// Stop terminates background health checks and waits for in-flight probes to finish.
 func (p *Prober) Stop() {
-	close(p.stopChan)
+	p.stopOnce.Do(func() {
+		close(p.stopChan)
+	})
 	p.wg.Wait()
 }

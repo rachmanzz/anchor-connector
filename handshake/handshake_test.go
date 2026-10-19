@@ -484,4 +484,3 @@ func TestClientHandshaker_PairingClosed(t *testing.T) {
 		t.Fatalf("expected 'pairing window closed' error, got: %v", err)
 	}
 }
-

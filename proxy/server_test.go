@@ -517,4 +517,3 @@ func TestProxy_ReplicationAndFailoverIntegration(t *testing.T) {
 		t.Fatalf("expected mutation in ring buffer, got count=%d latestLSN=%d", count, latestLSN)
 	}
 }
-

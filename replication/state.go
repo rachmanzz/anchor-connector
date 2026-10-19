@@ -28,11 +28,11 @@ type ReplicaReplicationState struct {
 
 // LagTracker maintains cluster-wide replication lag metrics and status quarantine.
 type LagTracker struct {
-	primaryLSN        uint64
-	replicas          map[string]*ReplicaReplicationState
-	maxToleratedLagMS int64
+	primaryLSN         uint64
+	replicas           map[string]*ReplicaReplicationState
+	maxToleratedLagMS  int64
 	maxToleratedLagLSN uint64
-	mu                sync.RWMutex
+	mu                 sync.RWMutex
 }
 
 // NewLagTracker constructs a new replication lag tracker.
@@ -45,8 +45,8 @@ func NewLagTracker(maxToleratedLagMS int64, maxToleratedLagLSN uint64) *LagTrack
 	}
 
 	return &LagTracker{
-		replicas:          make(map[string]*ReplicaReplicationState),
-		maxToleratedLagMS: maxToleratedLagMS,
+		replicas:           make(map[string]*ReplicaReplicationState),
+		maxToleratedLagMS:  maxToleratedLagMS,
 		maxToleratedLagLSN: maxToleratedLagLSN,
 	}
 }
@@ -198,4 +198,3 @@ func (lt *LagTracker) ReplicaAckLSN(replicaID string) uint64 {
 	}
 	return 0
 }
-

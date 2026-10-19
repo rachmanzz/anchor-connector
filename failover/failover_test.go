@@ -233,7 +233,7 @@ func TestFailoverCoordinator_ElectionAndPromotion(t *testing.T) {
 	defer cancel()
 
 	// 1. With primary healthy, EvaluateAndFailover should NOT trigger
-	promoted, node, err := coordinator.EvaluateAndFailover(ctx, "customers")
+	promoted, _, err := coordinator.EvaluateAndFailover(ctx, "customers")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -251,7 +251,7 @@ func TestFailoverCoordinator_ElectionAndPromotion(t *testing.T) {
 	}
 
 	// 3. Now EvaluateAndFailover should promote the replica
-	promoted, node, err = coordinator.EvaluateAndFailover(ctx, "customers")
+	promoted, node, err := coordinator.EvaluateAndFailover(ctx, "customers")
 	if err != nil {
 		t.Fatalf("failover failed: %v", err)
 	}

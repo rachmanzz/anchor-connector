@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"bytes"
 	"context"
 	"crypto/tls"
 	"encoding/json"
@@ -39,6 +40,8 @@ type Server struct {
 	httpLn           net.Listener
 	httpServer       *http.Server
 	activeConns      atomic.Int64
+	clientConns      map[net.Conn]struct{}
+	connsMu          sync.Mutex
 	closed           atomic.Bool
 	stopChan         chan struct{}
 	wg               sync.WaitGroup
@@ -73,13 +76,14 @@ func NewServer(
 	}
 
 	return &Server{
-		cfg:       cfg,
-		router:    r,
-		pool:      p,
-		auth:      auth,
-		ipFilter:  ipFilter,
-		tlsConfig: tlsCfg,
-		stopChan:  make(chan struct{}),
+		cfg:         cfg,
+		router:      r,
+		pool:        p,
+		auth:        auth,
+		ipFilter:    ipFilter,
+		tlsConfig:   tlsCfg,
+		clientConns: make(map[net.Conn]struct{}),
+		stopChan:    make(chan struct{}),
 	}
 }
 
@@ -190,7 +194,17 @@ func (s *Server) acceptWireConnections() {
 			continue
 		}
 
+		s.connsMu.Lock()
+		if s.closed.Load() {
+			s.connsMu.Unlock()
+			_ = conn.Close()
+			return
+		}
+		s.clientConns[conn] = struct{}{}
+		s.connsMu.Unlock()
+
 		s.activeConns.Add(1)
+		s.wg.Add(1)
 		go s.handleClient(conn)
 	}
 }
@@ -204,7 +218,11 @@ type clientSession struct {
 func (s *Server) handleClient(clientConn net.Conn) {
 	defer func() {
 		_ = clientConn.Close()
+		s.connsMu.Lock()
+		delete(s.clientConns, clientConn)
+		s.connsMu.Unlock()
 		s.activeConns.Add(-1)
+		s.wg.Done()
 	}()
 
 	sess := &clientSession{
@@ -529,28 +547,30 @@ func (s *Server) handlePrometheusMetrics(w http.ResponseWriter, r *http.Request)
 	w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
 	w.WriteHeader(http.StatusOK)
 
-	fmt.Fprintf(w, "# HELP anchor_connector_active_connections Current active TCP client connections\n")
-	fmt.Fprintf(w, "# TYPE anchor_connector_active_connections gauge\n")
-	fmt.Fprintf(w, "anchor_connector_active_connections %d\n", s.activeConns.Load())
+	var buf bytes.Buffer
+	fmt.Fprintf(&buf, "# HELP anchor_connector_active_connections Current active TCP client connections\n")
+	fmt.Fprintf(&buf, "# TYPE anchor_connector_active_connections gauge\n")
+	fmt.Fprintf(&buf, "anchor_connector_active_connections %d\n", s.activeConns.Load())
 
 	if s.replicationCoord != nil {
 		oldest, latest, count := s.replicationCoord.RingBuffer().Bounds()
-		fmt.Fprintf(w, "# HELP anchor_connector_ring_buffer_entries Number of mutations in RAM hot buffer\n")
-		fmt.Fprintf(w, "# TYPE anchor_connector_ring_buffer_entries gauge\n")
-		fmt.Fprintf(w, "anchor_connector_ring_buffer_entries %d\n", count)
+		fmt.Fprintf(&buf, "# HELP anchor_connector_ring_buffer_entries Number of mutations in RAM hot buffer\n")
+		fmt.Fprintf(&buf, "# TYPE anchor_connector_ring_buffer_entries gauge\n")
+		fmt.Fprintf(&buf, "anchor_connector_ring_buffer_entries %d\n", count)
 
-		fmt.Fprintf(w, "# HELP anchor_connector_primary_commit_lsn Highest committed LSN on primary\n")
-		fmt.Fprintf(w, "# TYPE anchor_connector_primary_commit_lsn counter\n")
-		fmt.Fprintf(w, "anchor_connector_primary_commit_lsn %d\n", s.replicationCoord.LagTracker().PrimaryCommitLSN())
+		fmt.Fprintf(&buf, "# HELP anchor_connector_primary_commit_lsn Highest committed LSN on primary\n")
+		fmt.Fprintf(&buf, "# TYPE anchor_connector_primary_commit_lsn counter\n")
+		fmt.Fprintf(&buf, "anchor_connector_primary_commit_lsn %d\n", s.replicationCoord.LagTracker().PrimaryCommitLSN())
 
-		fmt.Fprintf(w, "anchor_connector_hot_storage_oldest_lsn %d\n", oldest)
-		fmt.Fprintf(w, "anchor_connector_hot_storage_latest_lsn %d\n", latest)
+		fmt.Fprintf(&buf, "anchor_connector_hot_storage_oldest_lsn %d\n", oldest)
+		fmt.Fprintf(&buf, "anchor_connector_hot_storage_latest_lsn %d\n", latest)
 
 		for id, state := range s.replicationCoord.LagTracker().GetLagMatrix() {
-			fmt.Fprintf(w, "anchor_connector_replica_lag_lsn{replica=\"%s\"} %d\n", id, state.LagLSN)
-			fmt.Fprintf(w, "anchor_connector_replica_lag_milliseconds{replica=\"%s\"} %d\n", id, state.LagMilliseconds)
+			fmt.Fprintf(&buf, "anchor_connector_replica_lag_lsn{replica=\"%s\"} %d\n", id, state.LagLSN)
+			fmt.Fprintf(&buf, "anchor_connector_replica_lag_milliseconds{replica=\"%s\"} %d\n", id, state.LagMilliseconds)
 		}
 	}
+	_, _ = w.Write(buf.Bytes())
 }
 
 // Shutdown initiates graceful termination of both TCP and HTTP services.
@@ -569,11 +589,34 @@ func (s *Server) Shutdown(ctx context.Context) error {
 			errs = append(errs, err)
 		}
 	}
+
+	// Close all active client connections to interrupt blocking socket I/O
+	s.connsMu.Lock()
+	for conn := range s.clientConns {
+		_ = conn.Close()
+	}
+	s.connsMu.Unlock()
+
+	if s.replicationCoord != nil {
+		s.replicationCoord.Close()
+	}
+
 	if s.pool != nil {
 		_ = s.pool.Close()
 	}
 
-	s.wg.Wait()
+	waitDone := make(chan struct{})
+	go func() {
+		s.wg.Wait()
+		close(waitDone)
+	}()
+
+	select {
+	case <-waitDone:
+	case <-ctx.Done():
+		errs = append(errs, ctx.Err())
+	}
+
 	if len(errs) > 0 {
 		return errs[0]
 	}
